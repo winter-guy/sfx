@@ -111,7 +111,32 @@ gamecast watch -server ws://SIGNAL:8080/ws -room friday -out - | ffplay -fflags 
 
 Useful flags: `-upload N` (Mbps; 0 = measure against the signaling server),
 `-wired`, `-ice stun:…,turn:user:pass@host:3478`, `-bitrate 8000`,
-`-in file.h264 -loop` (replay a file instead of a live encoder).
+`-in file.h264 -loop` (replay a file instead of a live encoder),
+`-stats 5s` (diagnostics: log this process's own CPU, memory and goroutines;
+off unless given).
+
+### Resource use
+
+For diagnosis, any command can log its own consumption by adding `-stats 5s`
+(it is off by default):
+
+```
+stats: cpu 15.8% of 1 core (1.6% of 10) | peak rss 49.5 MB, go sys 41.3 MB, heap 20.4 MB | goroutines 249
+```
+
+Measured on an Apple Silicon Mac (10 cores) with an 8.7 Mbps stream, a streamer,
+a supernode, a backup and 6 more viewers, all on one machine:
+
+| Role | CPU (of one core) | Memory (peak RSS) |
+|---|---|---|
+| Signaling server | 0.5% | 13 MB |
+| Streamer (gamecast only; the encoder is extra) | 6% | 22 MB |
+| **Supernode** (forwarding to 7 viewers) | **16%** | 50 MB |
+| Backup (standby) | 9% | 25 MB |
+| Viewer | 8% | 20 MB |
+
+"cpu" is the share of one core (100% = one core fully busy). On macOS only
+*peak* RSS is available without cgo; Linux and Windows also report current RSS.
 
 Encoder settings matter: **no B-frames** (`-bf 0`), and a short GOP (`-g 30`).
 A piped encoder can't be asked for a keyframe on demand, so the GOP length
@@ -127,6 +152,7 @@ caps how fast new viewers and failovers get a picture.
 | `internal/peer/client.go` | Client: signaling, status heartbeat, topology → desired links, encode-once frame pump |
 | `internal/peer/links.go` | Persistent links: offer/answer, live/standby track swap, RTP forwarding, PLI→keyframe |
 | `internal/peer/source.go` | Annex-B → frames; `FrameSource` is where a native encoder plugs in |
+| `internal/procstats` | The process's own CPU / memory / goroutine sampling (Unix + Windows) |
 | `cmd/gamecast` | CLI |
 
 ## Not done yet
