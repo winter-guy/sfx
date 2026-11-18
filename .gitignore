@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*~
+
+# Local secrets / machine-specific settings
+.env
+.env.*
+.claude/settings.local.json
