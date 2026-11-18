@@ -21,6 +21,7 @@ import (
 	"github.com/pion/webrtc/v4"
 
 	"gamecast/internal/peer"
+	"gamecast/internal/procstats"
 	"gamecast/internal/proto"
 	"gamecast/internal/signaling"
 )
@@ -49,6 +50,11 @@ func main() {
 	}
 }
 
+const (
+	defaultStatsEvery = 0 // diagnostics only when asked for
+	statsHelp         = "diagnostics: log this process's CPU, memory and goroutines this often, e.g. 5s (default off)"
+)
+
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
   gamecast signal [-addr :8080]
@@ -62,7 +68,9 @@ run "gamecast <command> -h" for flags`)
 func runSignal(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("signal", flag.ExitOnError)
 	addr := fs.String("addr", ":8080", "listen address")
+	stats := fs.Duration("stats", defaultStatsEvery, statsHelp)
 	_ = fs.Parse(args)
+	go procstats.Log(ctx, *stats, log.Printf)
 	srv := &http.Server{Addr: *addr, Handler: signaling.NewServer().Handler()}
 	go func() {
 		<-ctx.Done()
@@ -87,6 +95,7 @@ func runPeer(ctx context.Context, role string, args []string) error {
 	wired := fs.Bool("wired", false, "this PC is on wired Ethernet (preferred as supernode)")
 	ice := fs.String("ice", "stun:stun.l.google.com:19302", "comma-separated STUN/TURN URLs (turn:user:pass@host:port)")
 	loopback := fs.Bool("loopback", false, "allow 127.0.0.1 candidates (single-machine demo)")
+	stats := fs.Duration("stats", defaultStatsEvery, statsHelp)
 
 	// stream
 	in := fs.String("in", "-", "stream: H.264 Annex-B input ('-' = stdin, or a file)")
@@ -98,6 +107,7 @@ func runPeer(ctx context.Context, role string, args []string) error {
 	canHost := fs.Bool("host", false, "watch: volunteer this PC as supernode")
 	out := fs.String("out", "-", "watch: write received H.264 here ('-' = stdout, '' = discard)")
 	_ = fs.Parse(args)
+	go procstats.Log(ctx, *stats, log.Printf)
 
 	needUpload := role == proto.RoleStreamer || *canHost
 	if *upload == 0 && needUpload {
