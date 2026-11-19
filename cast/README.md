@@ -105,23 +105,23 @@ It never touches video.
 
 ### Components
 
-```
-                    ┌──────────────────────────────┐
-                    │       signaling server       │   rooms, election,
-                    │  (cast signal, no media) │   health monitor, SDP relay
-                    └──────────────┬───────────────┘
-                                   │ WebSocket (JSON)
-        ┌──────────────────────────┼──────────────────────────────┐
-        │                          │                              │
-┌───────┴───────┐  1 stream  ┌─────┴──────┐   N-1 copies   ┌──────┴──────┐
-│   Streamer    │ ─────────▶ │ Supernode  │ ─────────────▶ │   Viewers   │
-│ capture+encode│   (RTP)    │ (a viewer) │     (RTP)      │ decode+play │
-└───────┬───────┘            └────────────┘                └──────▲──────┘
-        │                                                         │
-        │ standby (connected, idle) ┌────────────┐  standby       │
-        └─────────────────────────▶ │   Backup   │ ───────────────┘
-                                    │ (a viewer) │
-                                    └────────────┘
+```mermaid
+flowchart LR
+    SIG["Signaling server<br/>cast signal<br/>(no media)"]
+    ST["Streamer<br/>capture + encode"]
+    SN["Supernode<br/>(a viewer)"]
+    BK["Backup<br/>(a viewer)"]
+    V["Viewers<br/>decode + play"]
+
+    SIG -. "WebSocket (JSON):<br/>rooms, election, health, SDP relay" .- ST
+    SIG -.- SN
+    SIG -.- BK
+    SIG -.- V
+
+    ST == "1 stream (RTP)" ==> SN
+    SN == "N-1 copies (RTP)" ==> V
+    ST -. "standby (connected, idle)" .-> BK
+    BK -. standby .-> V
 ```
 
 | Component | Command | What it does |
@@ -212,6 +212,18 @@ upload ≥ 1.3 × bitrate × copies it must send
 
 **Election order** ([election.go](internal/signaling/election.go)):
 
+```mermaid
+flowchart TD
+    A{"Only one viewer?"} -- yes --> S0["Streamer sends directly"]
+    A -- no --> B{"Current host<br/>still qualifies?"}
+    B -- yes --> S1["Keep current host"]
+    B -- no --> C{"Streamer can<br/>serve everyone?"}
+    C -- yes --> S2["Streamer is host"]
+    C -- no --> D{"Any opted-in viewer<br/>qualifies?"}
+    D -- yes --> S3["Best viewer: wired, then most upload,<br/>then earliest join"]
+    D -- no --> S4["Degraded: most spare upload,<br/>topology flagged degraded"]
+```
+
 0. **One viewer:** the streamer sends directly. It uploads one copy either way, so a relay would only add a hop.
 1. **Keep the current host** while it still qualifies, to avoid needless switches.
 2. **The streamer**, if it can serve everyone itself (one hop less latency).
@@ -263,13 +275,24 @@ server does nothing.
 
 **What happens on failover:**
 
-```
-t=0      supernode freezes (sockets stay open, nothing is sent)
-~400ms   viewers' video stalls; their next heartbeat says "stalled"
-~520ms   server: most viewers stalled + no heartbeat for >500ms → host failed
-         server: backup promoted, new backup elected, topology broadcast
-~520ms   streamer swaps the real track onto the backup link, forces a keyframe
-~570ms   backup forwards; viewers switch playback to the backup link → picture
+```mermaid
+sequenceDiagram
+    participant St as Streamer
+    participant H as Supernode
+    participant B as Backup
+    participant Srv as Signaling server
+    participant V as Viewers
+
+    Note over H: t=0 freezes (sockets stay open, nothing sent)
+    Note over V: ~400 ms video stalls
+    V->>Srv: status: stalled
+    Note over Srv: ~520 ms most viewers stalled +<br/>no host heartbeat for >500 ms → host failed
+    Srv->>St: topology (backup promoted, new backup elected)
+    Srv->>B: topology
+    Srv->>V: topology
+    St->>B: real track swapped onto standby link + forced keyframe
+    B->>V: forward stream
+    Note over V: ~570 ms switch playback to backup link → picture
 ```
 
 **Measured:**
@@ -290,8 +313,9 @@ ffmpeg encoder, viewers also wait for the next scheduled keyframe. See
 A viewer can only start decoding H.264 at a keyframe (IDR). Keyframe requests
 travel as RTCP PLI messages:
 
-```
-viewer ──PLI──▶ supernode ──PLI──▶ streamer ──▶ encoder: "next frame is a keyframe"
+```mermaid
+flowchart LR
+    V[Viewer] -- PLI --> SN[Supernode] -- PLI --> ST[Streamer] -- "next frame is a keyframe" --> E[Encoder]
 ```
 
 - Requests are throttled to **one per 500 ms** per hop, because every keyframe is
@@ -311,17 +335,22 @@ viewer ──PLI──▶ supernode ──PLI──▶ streamer ──▶ encode
 Voice is split between two processes. **cast (Go)** carries the packets;
 the **voice sidecar (Rust)** does all the audio work:
 
-```
-            cast (Go)                          voice (Rust sidecar)
-  ┌───────────────────────────────┐   UDP   ┌──────────────────────────────────────┐
-  │ voice mesh: 1 PeerConnection  │ ◀────── │ mic ─▶ sonora: echo cancel, noise   │
-  │ per pair of voice peers,      │  Opus   │        suppression, AGC ─▶ Opus 32k │
-  │ Opus RTP both ways            │   RTP   │                                      │
-  │                               │ ──────▶ │ voices ─▶ jitter buffer (per SSRC) ─┐│
-  │ game audio (from video tree)  │ ──────▶ │ game   ─▶ jitter buffer ────────────┤│
-  └───────────────────────────────┘         │            mix ─▶ speakers  ◀───────┘│
-                                            │              └──▶ echo reference      │
-                                            └──────────────────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph GO["cast (Go)"]
+        MESH["Voice mesh<br/>1 PeerConnection per pair<br/>Opus RTP both ways"]
+        GAME["Game audio<br/>(from video tree)"]
+    end
+    subgraph RS["voice (Rust sidecar)"]
+        MIC["Mic"] --> APM["sonora: echo cancel,<br/>noise suppression, AGC"] --> ENC["Opus 32k"]
+        JV["Jitter buffer<br/>(per SSRC)"] --> MIX["Mix"]
+        JG["Jitter buffer"] --> MIX
+        MIX --> SPK["Speakers"]
+        MIX -. echo reference .-> APM
+    end
+    ENC -- "UDP Opus RTP" --> MESH
+    MESH -- "voices" --> JV
+    GAME -- "game" --> JG
 ```
 
 - **Mesh, not the supernode tree.** Every voice peer has one sendrecv audio
@@ -515,6 +544,26 @@ picture should continue through the backup, and the server log shows
 `host … declared failed`.
 
 ### A real session
+
+How the processes connect on each machine:
+
+```mermaid
+flowchart LR
+    subgraph SM["Streamer PC"]
+        FF["ffmpeg<br/>capture + encode"] -- "H.264 on stdin" --> CS["cast stream"]
+        FF -- "Opus RTP<br/>127.0.0.1:5004" --> CS
+        CS -. "-voice" .- VS1["voice sidecar"]
+    end
+    subgraph VM["Viewer PC"]
+        CW["cast watch"] -- "H.264 on stdout" --> FP["ffplay"]
+        CW -. "-audio-out" .-> OGG["audio.ogg"]
+        CW -. "-voice" .- VS2["voice sidecar<br/>(also plays game audio)"]
+    end
+    SIG["cast signal"]
+    CS <-- WebSocket --> SIG
+    CW <-- WebSocket --> SIG
+    CS == "WebRTC (directly or via supernode)" ==> CW
+```
 
 1. **Run the signaling server** somewhere everyone can reach: a small VPS, or one
    of the PCs with port 8080 forwarded.
@@ -761,6 +810,27 @@ JSON messages over one WebSocket per client (`/ws`). Defined in
 | `signal` | client → server → client | SDP offer/answer, tagged with a link ID |
 | `status` | client → server, every 250 ms | Heartbeat: upstream peer and `flowing`/`waiting`/`stalled`/`none` |
 | `error` | server → client | Fatal error (for example, a second streamer joining the same room) |
+
+**A typical exchange** (a viewer joins a room where `p2` is host):
+
+```mermaid
+sequenceDiagram
+    participant C as New viewer (p3)
+    participant Srv as Signaling server
+    participant H as Host (p2)
+
+    C->>Srv: join
+    Srv->>C: welcome (peer ID)
+    Srv->>C: topology
+    Srv->>H: topology
+    H->>Srv: signal (offer, link p2>p3#n)
+    Srv->>C: signal (offer)
+    C->>Srv: signal (answer, same link ID)
+    Srv->>H: signal (answer)
+    loop every 250 ms
+        C->>Srv: status (upstream, state)
+    end
+```
 
 **Examples:**
 

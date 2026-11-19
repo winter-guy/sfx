@@ -9,6 +9,14 @@ process. cast (Go) carries voice over WebRTC; this program does the audio:
 - RTP from cast (other people's voices, game audio) → jitter buffers → mix →
   speakers, with everything played used as the echo reference
 
+```mermaid
+flowchart LR
+    MIC["Microphone"] --> APM["sonora<br/>echo cancel, noise suppression, AGC"] --> ENC["Opus encode"]
+    ENC -- "RTP (UDP)" --> CAST["cast (Go)"]
+    CAST -- "voices, game audio<br/>RTP (UDP)" --> JB["Jitter buffers"] --> MIX["Mix"] --> SPK["Speakers"]
+    MIX -. "echo reference" .-> APM
+```
+
 ```sh
 cargo build --release            # needs libopus (brew install opus / apt install libopus-dev)
 cargo build --release --features bundled   # or: build libopus from source, static (needs cmake)
