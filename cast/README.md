@@ -362,11 +362,23 @@ flowchart LR
   packets go out on every voice link.
 - **Echo cancellation sees everything you hear.** The sidecar plays voices *and*
   game audio, so both are in the echo canceller's reference signal and your mic
-  doesn't send them back. On the **streamer**, the game is already playing
+  doesn't send them back. The reference is built from exactly what the speakers
+  play, clipping included. On the **streamer**, the game is already playing
   through the OS, so the sidecar gets game audio as *reference only*
   (`--game reference`), not to play.
+- **The streamer's mic is delayed by 80 ms.** The canceller can only remove
+  echo that arrives *after* its reference. On the streamer, the reference (game
+  audio) comes via loopback capture → encoder → RTP, which is slower than
+  speakers → air → mic, so without a delay the echo arrives first and isn't
+  cancelled. In simulation, with the echo arriving 50 ms before its reference,
+  cancellation went from 2.7 dB without the delay to 26.4 dB with it. The cost
+  is 80 ms of extra latency on the streamer's voice. The streamer's reference
+  also skips the jitter buffer's startup wait. Tune it with `-voice-mic-delay`.
 - **Jitter buffer** per speaker: reorders packets, conceals short gaps with
   Opus packet loss concealment, skips long gaps, and caps buffering at 200 ms.
+  A packet far *behind* the playout position (more than 100 packets) means the
+  sender restarted with a new sequence number, so the buffer starts over
+  instead of dropping everything as late.
 - **Devices:** the default microphone and speakers via cpal (CoreAudio, WASAPI,
   ALSA), resampled to 48 kHz as needed.
 - **Process protocol:** the sidecar prints one handshake line on stdout
@@ -663,6 +675,7 @@ apply to that command.
 | `-voice-input` | `default` | both | Microphone: `default`, `sine:FREQ` (test tone) or `silence`. |
 | `-voice-output` | `default` | both | Playback: `default` (speakers), `raw:PATH` (f32le 48 kHz stereo file) or `null`. |
 | `-voice-muted` | `false` | both | Start with the microphone muted. |
+| `-voice-mic-delay` | `-1` | both | Milliseconds to hold the mic back before echo cancellation. `-1` = sidecar default: 80 on the streamer, 0 on viewers. Raise it if others hear the game through the streamer's mic. |
 | `-audio-out` | none | watch | Where to write received game audio as Ogg/Opus: a file, a named pipe, or `-` for stdout (only if `-out` isn't `-`). Empty = don't write audio. |
 
 ### `voice` (sidecar)
@@ -682,6 +695,7 @@ voice --list-devices          # show the default devices, without opening them
 | `--game` | `play` | `play`, `reference` (echo-cancel only; used on the streamer) or `off` |
 | `--bitrate` | `32000` | Opus bitrate for the mic |
 | `--muted` | off | Start muted |
+| `--mic-delay` | 80 with `--game reference`, else 0 | Hold the mic back (ms) before echo cancellation |
 | `--no-aec`, `--no-ns`, `--no-agc` | on | Disable echo cancellation, noise suppression or automatic gain control |
 | `--echo-sim G:MS` | off | Test aid: leak G × the speaker output into the mic MS ms later |
 
@@ -957,11 +971,15 @@ GOOS=windows go vet ./...                # check the Windows build
 | `TestFailoverWhenSupernodeLeaves` | A clean leave recovers within 500 ms (measured ~20 ms) |
 | `TestStreamerPauseDoesNotTriggerFailover` | A 3 s streamer stall doesn't change the host; the stream resumes through the same host |
 | `TestRTPAudioSourceReceivesOpusAndSkipsJunk` | The UDP audio input accepts Opus RTP and ignores non-RTP and RTCP datagrams |
+| `TestRTCPPortOnlyBoundWhenAsked` | `-audio-in` binds port+1 for the encoder's RTCP; the voice mic receiver doesn't |
+| `TestAudioSinkStopsOnWriteErrorAndLogsOnce`, `TestAudioSinkSkipsMalformedPacket` | `-audio-out` stops and logs once on an I/O error; a malformed packet is skipped without stopping it |
 | `TestAudioSinkWritesOggOpus` | Viewer audio output is a valid Ogg/Opus stream containing every packet |
 | Audio in the integration tests | Every viewer receives game audio through the supernode; after a supernode hang, audio resumes through the backup |
 | `TestVoiceChatEchoCancellationEndToEnd` | Real sidecars in two viewers: B hears A; with B's speakers leaking into its mic, A's echo comes back ≥ 20 dB quieter with echo cancellation than without (measured 64 dB); muting A silences it at B |
 | `TestVoiceSidecarGetsGameAudio` | Game audio is forwarded to the sidecar (≥ 50 packets in 2 s) |
-| Rust: `cargo test` in `../voice/` | RTP parsing; Opus round trip; jitter buffer ordering, wrap-around, loss concealment, late packets, latency cap; resampling; mixing and mute; echo cancellation in a simulated room (measured 76 dB reduction) |
+| `TestVoiceStartupErrorIsLogged` | A sidecar that fails at startup gets its error line into cast's log |
+| `TestStalePendingVoiceOffersAreDropped` | Parked voice offers from peers who left voice are discarded |
+| Rust: `cargo test` in `../voice/` (15 tests) | RTP parsing; Opus round trip; jitter buffer ordering, wrap-around, loss concealment, late packets, latency cap, restart after a backward sequence jump, immediate start; resampling; mixing and mute; echo reference equals the clipped speaker output; echo cancellation in a simulated room (76 dB); streamer case with the echo 50 ms ahead of its reference (26.4 dB with the mic delay vs 2.7 dB without) |
 | `TestSampleSeesCPUAndMemory` | `-stats` reports CPU under load, drops when idle, and reports memory |
 
 The integration tests run a real signaling server and real WebRTC peers in one
@@ -1082,6 +1100,10 @@ applies when links are first set up, never during failover.
   real rooms, not the 64–76 dB measured with simulated echo.
 - **Voice uses the default devices only;** no device selection, per-speaker
   volume or push-to-talk yet.
+- **The streamer's 80 ms mic delay is an estimate.** It's based on typical
+  capture, encoder and device latencies, verified only in simulation. Real
+  setups may need a different `-voice-mic-delay`, and the streamer's voice
+  reaches others 80 ms later.
 - **Voice loss recovery is concealment only.** Opus in-band FEC is sent but not
   yet used on receive.
 - **The sidecar links the system libopus by default,** so the target machine
@@ -1124,7 +1146,7 @@ This is a prototype. **Don't expose it to untrusted users yet.**
 |---|---|---|
 | 1 | **Real-world testing** | Real video and audio via ffmpeg, peers on different networks, TURN, Windows |
 | 2 | **Native capture + GPU encoding** | Windows.Graphics.Capture / ScreenCaptureKit with NVENC / AMF / QSV / VideoToolbox behind `FrameSource`, plus WASAPI loopback / ScreenCaptureKit audio behind `AudioSource`: keyframes on request, no ffmpeg, no loopback device |
-| 3 | **Voice polish** | Test with real devices; device selection, per-speaker volume, push-to-talk, in-band FEC recovery, static libopus in release builds |
+| 3 | **Voice polish** | Test with real devices (including tuning the streamer's mic delay); device selection, per-speaker volume, push-to-talk, in-band FEC recovery, static libopus in release builds. Longer term: capture system audio in the sidecar so the streamer's reference needs no mic delay |
 | 4 | **In-app player and desktop UI** | Hardware decode, vsync-paced rendering, audio/video sync; UI built on `OnTopology` |
 | 5 | **Bitrate adaptation** | From congestion feedback (TWCC/REMB); temporal SVC so weak viewers get 30 fps |
 | 6 | **Security** | Room tokens, `wss://`, SFrame end-to-end encryption |
@@ -1153,6 +1175,8 @@ This is a prototype. **Don't expose it to untrusted users yet.**
 | Sidecar fails to start: library not loaded / `libopus` | It links the system libopus. Install it, or build with `cargo build --release --features bundled`. |
 | `voice: error: no microphone found` | No default input device. Use `-voice-input silence` to listen only. |
 | Others hear themselves echo | The echo canceller needs a few seconds to adapt. Make sure game audio is played by the sidecar (`-voice`), not by a separate player, so it's in the echo reference. |
+| Others hear the game through the streamer's mic | The streamer's echo reference arrives too late for its setup. Raise `-voice-mic-delay` on the streamer (try 120–200). |
+| `audio output stopped: …` in the log | `-audio-out` hit an I/O error (pipe reader gone, disk full). Audio output stays off until restart. |
 | Stream stutters for everyone | The supernode's upload is saturated. Check `-stats` and the router; enable SQM/QoS. |
 
 ## FAQ
