@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -141,5 +142,51 @@ func TestVoiceSidecarGetsGameAudio(t *testing.T) {
 	n, _ := strconv.Atoi(logs.find(stats)[1])
 	if n < 50 {
 		t.Errorf("sidecar received %d game-audio packets in 2s, want ≥ 50", n)
+	}
+}
+
+func TestStalePendingVoiceOffersAreDropped(t *testing.T) {
+	c, err := New(Config{Role: proto.RoleViewer})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.id = "p2"
+	offer := func(from string) proto.Message {
+		return proto.Message{Type: proto.TypeSignal, From: from, Link: "voice/x", Signal: &proto.Signal{Kind: "offer"}}
+	}
+	c.voicePending["p1"] = offer("p1") // still in voice
+	c.voicePending["p9"] = offer("p9") // left
+	c.mu.Lock()
+	c.reconcileVoiceLocked(proto.Topology{Voice: []string{"p1", "p2"}})
+	c.mu.Unlock()
+	if _, ok := c.voicePending["p9"]; ok {
+		t.Error("offer from a peer no longer in voice should be dropped")
+	}
+	if _, ok := c.voicePending["p1"]; !ok {
+		t.Error("offer from a peer still in voice should be kept until accepted")
+	}
+}
+
+// The sidecar's last words (here: a startup error) must reach our log even
+// though it exits immediately. startVoice only calls cmd.Wait after both pipe
+// readers hit EOF, as os/exec requires. Note: the old ordering didn't lose
+// lines on the development machine either, so this checks the behaviour; it
+// isn't a reliable reproduction of that race.
+func TestVoiceStartupErrorIsLogged(t *testing.T) {
+	bin := voiceBin(t)
+	for i := 0; i < 5; i++ {
+		var mu sync.Mutex
+		var logs []string
+		_, err := startVoice(VoiceConfig{Bin: bin, Args: []string{"--input", "bogus"}}, "play",
+			func(f string, a ...any) { mu.Lock(); logs = append(logs, fmt.Sprintf(f, a...)); mu.Unlock() })
+		if err == nil {
+			t.Fatal("startVoice should fail with an invalid --input")
+		}
+		mu.Lock()
+		found := slices.ContainsFunc(logs, func(l string) bool { return strings.Contains(l, `unknown input "bogus"`) })
+		mu.Unlock()
+		if !found {
+			t.Fatalf("attempt %d: sidecar's error line missing from log: %q (err: %v)", i, logs, err)
+		}
 	}
 }

@@ -17,6 +17,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -119,6 +120,7 @@ func runPeer(ctx context.Context, role string, args []string) error {
 	voiceIn := fs.String("voice-input", "default", "voice: microphone: default | sine:FREQ | silence")
 	voiceOut := fs.String("voice-output", "default", "voice: playback: default | raw:PATH | null")
 	voiceMuted := fs.Bool("voice-muted", false, "voice: start with the microphone muted")
+	voiceMicDelay := fs.Int("voice-mic-delay", -1, "voice: ms to hold the mic back before echo cancellation (-1 = sidecar default: 80 on the streamer, 0 on viewers)")
 	_ = fs.Parse(args)
 	go procstats.Log(ctx, *stats, log.Printf)
 
@@ -218,6 +220,9 @@ func runPeer(ctx context.Context, role string, args []string) error {
 			Bin:   bin,
 			Args:  []string{"--input", *voiceIn, "--output", *voiceOut},
 			Muted: *voiceMuted,
+		}
+		if *voiceMicDelay >= 0 {
+			cfg.Voice.Args = append(cfg.Voice.Args, "--mic-delay", strconv.Itoa(*voiceMicDelay))
 		}
 	}
 

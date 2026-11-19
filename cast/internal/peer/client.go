@@ -170,7 +170,7 @@ func New(cfg Config) (*Client, error) {
 		c.out = &outputSink{w: cfg.Output}
 	}
 	if cfg.AudioOutput != nil {
-		c.audioOut = newAudioSink(cfg.AudioOutput)
+		c.audioOut = newAudioSink(cfg.AudioOutput, cfg.Logf)
 	}
 	return c, nil
 }

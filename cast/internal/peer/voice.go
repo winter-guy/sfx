@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os/exec"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -47,7 +48,7 @@ func startVoice(cfg VoiceConfig, gameMode string, logf func(string, ...any)) (*v
 	if cfg.Bin == "" {
 		return nil, errors.New("voice: no voice sidecar binary configured")
 	}
-	mic, err := ListenRTPAudio("127.0.0.1:0")
+	mic, err := listenRTP("127.0.0.1:0", false) // the sidecar never sends RTCP
 	if err != nil {
 		return nil, err
 	}
@@ -72,7 +73,13 @@ func startVoice(cfg VoiceConfig, gameMode string, logf func(string, ...any)) (*v
 	}
 	v := &voiceEngine{cmd: cmd, stdin: stdin, mic: mic, done: make(chan struct{})}
 
+	// Wait closes the pipes, so it must only run after both readers have hit
+	// EOF; otherwise the sidecar's last lines (a startup error, its exit
+	// stats) can be lost.
+	var readers sync.WaitGroup
+	readers.Add(2)
 	go func() { // sidecar logs → our log
+		defer readers.Done()
 		sc := bufio.NewScanner(stderr)
 		for sc.Scan() {
 			logf("%s", sc.Text())
@@ -80,6 +87,7 @@ func startVoice(cfg VoiceConfig, gameMode string, logf func(string, ...any)) (*v
 	}()
 	ready := make(chan string, 1)
 	go func() { // handshake line, then keep draining
+		defer readers.Done()
 		sc := bufio.NewScanner(stdout)
 		for sc.Scan() {
 			if line := sc.Text(); strings.HasPrefix(line, "READY ") {
@@ -91,6 +99,7 @@ func startVoice(cfg VoiceConfig, gameMode string, logf func(string, ...any)) (*v
 		}
 	}()
 	go func() {
+		readers.Wait()
 		err := cmd.Wait()
 		logf("voice engine exited (%v)", err)
 		close(v.done)
@@ -196,7 +205,7 @@ func voiceOfferer(me, peer string) bool { return me < peer }
 func (c *Client) reconcileVoiceLocked(t proto.Topology) {
 	me := c.id
 	want := map[string]bool{}
-	if c.voice.Load() != nil && contains(t.Voice, me) {
+	if c.voice.Load() != nil && slices.Contains(t.Voice, me) {
 		for _, p := range t.Voice {
 			if p != me && p != "" {
 				want[p] = true
@@ -216,20 +225,14 @@ func (c *Client) reconcileVoiceLocked(t proto.Topology) {
 		}
 	}
 	for p, m := range c.voicePending {
-		if want[p] {
+		switch {
+		case want[p]:
 			delete(c.voicePending, p)
 			c.acceptVoiceLocked(m)
+		case !slices.Contains(t.Voice, p):
+			delete(c.voicePending, p) // sender left the room or voice
 		}
 	}
-}
-
-func contains(list []string, s string) bool {
-	for _, x := range list {
-		if x == s {
-			return true
-		}
-	}
-	return false
 }
 
 func (c *Client) openVoiceLocked(peer string) {
