@@ -24,6 +24,7 @@ It never touches video.
 ## Contents
 
 - [Highlights](#highlights)
+- [cast agent protocol (draft spec)](AGENT_PROTOCOL.md): JSON-RPC 2.0 over stdio, how a desktop app controls the core
 - [Project status](#project-status)
 - [How it works](#how-it-works)
   - [Components](#components)
