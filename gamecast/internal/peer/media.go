@@ -28,6 +28,12 @@ func newAPI(includeLoopback bool) (*webrtc.API, error) {
 	}, webrtc.RTPCodecTypeVideo); err != nil {
 		return nil, err
 	}
+	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
+		RTPCodecCapability: OpusCapability,
+		PayloadType:        opusPayloadType,
+	}, webrtc.RTPCodecTypeAudio); err != nil {
+		return nil, err
+	}
 
 	// NACK (retransmissions), RTCP reports and TWCC. On a supernode this means
 	// a viewer's lost packet is re-sent by the host, not the streamer.

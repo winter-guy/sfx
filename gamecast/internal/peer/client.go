@@ -47,8 +47,13 @@ type Config struct {
 	FPS    int  // nominal frame rate
 	Pace   bool // sleep 1/FPS between frames (for files); live encoders pace themselves
 
+	// Streamer: game audio (optional). Opus RTP packets, e.g. RTPAudioSource.
+	Audio AudioSource
+
 	// Viewer: received video as an Annex-B H.264 stream (pipe it to a player).
 	Output io.Writer
+	// Viewer: received game audio as an Ogg/Opus stream (optional).
+	AudioOutput io.Writer
 
 	Logf func(format string, args ...any)
 }
@@ -83,10 +88,17 @@ type Client struct {
 	sample *webrtc.TrackLocalStaticSample
 	idle   *webrtc.TrackLocalStaticSample
 	srcKF  *throttle
+	// Game audio, same live/standby scheme. Every link negotiates audio, so
+	// these exist even when the streamer has no audio source.
+	audio     *webrtc.TrackLocalStaticRTP
+	audioIdle *webrtc.TrackLocalStaticRTP
 
-	// Viewer: when host or backup, packets from the streamer are re-sent on fwd.
-	fwd *webrtc.TrackLocalStaticRTP
-	out *outputSink
+	// Viewer: when host or backup, packets from the streamer are re-sent on
+	// fwd / fwdAudio.
+	fwd      *webrtc.TrackLocalStaticRTP
+	fwdAudio *webrtc.TrackLocalStaticRTP
+	out      *outputSink
+	audioOut *audioSink
 
 	hung atomic.Bool // test hook: behave like a frozen process
 }
@@ -122,13 +134,25 @@ func New(cfg Config) (*Client, error) {
 			return nil, err
 		}
 		c.srcKF = newThrottle(keyframeMinInterval, cfg.Source.RequestKeyframe)
+		if c.audio, err = webrtc.NewTrackLocalStaticRTP(OpusCapability, "audio", "gamecast"); err != nil {
+			return nil, err
+		}
+		if c.audioIdle, err = webrtc.NewTrackLocalStaticRTP(OpusCapability, "audio", "gamecast"); err != nil {
+			return nil, err
+		}
 	} else {
 		if c.fwd, err = webrtc.NewTrackLocalStaticRTP(H264Capability, "video", "gamecast"); err != nil {
+			return nil, err
+		}
+		if c.fwdAudio, err = webrtc.NewTrackLocalStaticRTP(OpusCapability, "audio", "gamecast"); err != nil {
 			return nil, err
 		}
 	}
 	if cfg.Output != nil {
 		c.out = &outputSink{w: cfg.Output}
+	}
+	if cfg.AudioOutput != nil {
+		c.audioOut = newAudioSink(cfg.AudioOutput)
 	}
 	return c, nil
 }
@@ -186,6 +210,9 @@ func (c *Client) Run(ctx context.Context) error {
 
 	if c.cfg.Role == proto.RoleStreamer {
 		go c.pumpFrames(ctx)
+		if c.cfg.Audio != nil {
+			go c.pumpAudio(ctx)
+		}
 	}
 	go c.statusLoop(ctx)
 
@@ -256,6 +283,21 @@ func (c *Client) pumpFrames(ctx context.Context) {
 		}
 		last = time.Now()
 		_ = c.sample.WriteSample(media.Sample{Data: f.Data, Duration: dur})
+	}
+}
+
+// pumpAudio moves Opus packets from the audio source onto the shared audio
+// track. Like video, each packet is sent once per live link, never re-encoded.
+func (c *Client) pumpAudio(ctx context.Context) {
+	for ctx.Err() == nil {
+		p, err := c.cfg.Audio.NextPacket()
+		if err != nil {
+			if ctx.Err() == nil {
+				c.cfg.Logf("audio source: %v", err)
+			}
+			return
+		}
+		_ = c.audio.WriteRTP(p)
 	}
 }
 

@@ -27,13 +27,14 @@ type link struct {
 	stop context.CancelFunc
 
 	// send side
-	sender *webrtc.RTPSender
-	live   atomic.Bool // streamer only: carrying the real track, not the idle one
+	sender      *webrtc.RTPSender // video
+	audioSender *webrtc.RTPSender
+	live        atomic.Bool // streamer only: carrying the real tracks, not the idle ones
 
 	// receive side
-	ssrc        atomic.Uint32
-	lastPkt     atomic.Int64 // unix nanos
-	activeSince atomic.Int64 // unix nanos: became the playback source
+	ssrc        atomic.Uint32 // video SSRC, for keyframe requests
+	lastPkt     atomic.Int64  // unix nanos, video only (drives the stall detector)
+	activeSince atomic.Int64  // unix nanos: became the playback source
 	writer      atomic.Pointer[h264writer.H264Writer]
 	kf          *throttle // PLI to this link's sender
 }
@@ -86,12 +87,26 @@ func (c *Client) trackFor(live bool) webrtc.TrackLocal {
 	return c.fwd
 }
 
+// audioTrackFor is trackFor for game audio.
+func (c *Client) audioTrackFor(live bool) webrtc.TrackLocal {
+	if c.audio != nil {
+		if live {
+			return c.audio
+		}
+		return c.audioIdle
+	}
+	return c.fwdAudio
+}
+
 // setLiveLocked flips a streamer link between standby and live. This is the
 // whole failover on the streamer side: no renegotiation, just a track swap.
 func (c *Client) setLiveLocked(l *link, live bool) {
 	if err := l.sender.ReplaceTrack(c.trackFor(live)); err != nil {
 		c.cfg.Logf("send → %s: switch: %v", l.peer, err)
 		return
+	}
+	if err := l.audioSender.ReplaceTrack(c.audioTrackFor(live)); err != nil {
+		c.cfg.Logf("send → %s: audio switch: %v", l.peer, err)
 	}
 	l.live.Store(live)
 	state := "standby"
@@ -115,8 +130,14 @@ func (c *Client) openSendLocked(peer string, live bool) {
 		pc.Close()
 		return
 	}
+	if l.audioSender, err = pc.AddTrack(c.audioTrackFor(live)); err != nil {
+		c.cfg.Logf("add audio track for %s: %v", peer, err)
+		pc.Close()
+		return
+	}
 	c.links[sendKey(peer)] = l
 	go c.readFeedback(l)
+	go drainRTCP(l.audioSender)
 
 	pc.OnConnectionStateChange(func(st webrtc.PeerConnectionState) {
 		c.cfg.Logf("send → %s: %s", peer, st)
@@ -187,6 +208,15 @@ func (c *Client) readFeedback(l *link) {
 	}
 }
 
+// drainRTCP reads (and discards) RTCP so the sender's interceptors keep running.
+func drainRTCP(s *webrtc.RTPSender) {
+	for {
+		if _, _, err := s.ReadRTCP(); err != nil {
+			return
+		}
+	}
+}
+
 // keyframeFor handles a keyframe need on a send link: the streamer asks its
 // encoder (only for live links), a forwarder asks the streamer, but only
 // while it is actually receiving (a silent backup must not cause keyframes).
@@ -241,10 +271,12 @@ func (c *Client) answer(l *link, sdp string) {
 	pc.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
 		c.receive(l, track)
 	})
-	if _, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo,
-		webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly}); err != nil {
-		c.cfg.Logf("transceiver: %v", err)
-		return
+	for _, kind := range []webrtc.RTPCodecType{webrtc.RTPCodecTypeVideo, webrtc.RTPCodecTypeAudio} {
+		if _, err := pc.AddTransceiverFromKind(kind,
+			webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly}); err != nil {
+			c.cfg.Logf("%s transceiver: %v", kind, err)
+			return
+		}
 	}
 	if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: sdp}); err != nil {
 		c.cfg.Logf("offer from %s: %v", l.peer, err)
@@ -275,6 +307,10 @@ func (c *Client) answer(l *link, sdp string) {
 // untouched (no decode, no re-encode) when this peer is host or backup, and
 // written to the player when this link is the playback source.
 func (c *Client) receive(l *link, track *webrtc.TrackRemote) {
+	if track.Kind() == webrtc.RTPCodecTypeAudio {
+		c.receiveAudio(l, track)
+		return
+	}
 	l.ssrc.Store(uint32(track.SSRC()))
 	if c.playFrom.Load().(string) == l.peer || c.fwdFrom.Load().(string) == l.peer {
 		l.kf.Trigger()
@@ -299,6 +335,29 @@ func (c *Client) receive(l *link, track *webrtc.TrackRemote) {
 			if w := l.writer.Load(); w != nil {
 				_ = w.WriteRTP(pkt)
 			}
+		}
+	}
+}
+
+// receiveAudio is receive for game audio: forward when host/backup, play when
+// this link is the playback source. Audio doesn't feed the stall detector;
+// video is what viewers notice first.
+func (c *Client) receiveAudio(l *link, track *webrtc.TrackRemote) {
+	for {
+		pkt, _, err := track.ReadRTP()
+		if err != nil {
+			return
+		}
+		if c.hung.Load() {
+			continue
+		}
+		pkt.Header.Extension = false
+		pkt.Header.Extensions = nil
+		if c.fwdFrom.Load().(string) == l.peer {
+			_ = c.fwdAudio.WriteRTP(pkt)
+		}
+		if c.audioOut != nil && c.playFrom.Load().(string) == l.peer {
+			c.audioOut.WriteRTP(pkt)
 		}
 	}
 }

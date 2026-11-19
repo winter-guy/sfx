@@ -3,12 +3,15 @@ package peer
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/pion/rtp"
 
 	"gamecast/internal/proto"
 	"gamecast/internal/signaling"
@@ -57,6 +60,31 @@ func (s *synthSource) RequestKeyframe() {
 	s.forceKey.Store(true)
 }
 
+// synthAudio emits one 20 ms Opus RTP packet every 20 ms. The payload is a
+// valid TOC byte (config 31: 20 ms fullband, stereo, one frame) followed by
+// a marker and a counter, so tests can find packets in the Ogg output.
+type synthAudio struct {
+	seq uint16
+	ts  uint32
+	n   uint32
+}
+
+var audioMarker = []byte("GAMEAUDIO")
+
+func (a *synthAudio) NextPacket() (*rtp.Packet, error) {
+	time.Sleep(20 * time.Millisecond)
+	a.seq++
+	a.ts += 960
+	a.n++
+	payload := append([]byte{0xFC}, audioMarker...)
+	payload = binary.BigEndian.AppendUint32(payload, a.n)
+	payload = append(payload, make([]byte, 100)...)
+	return &rtp.Packet{
+		Header:  rtp.Header{Version: 2, PayloadType: 97, SequenceNumber: a.seq, Timestamp: a.ts, SSRC: 0xA0D10},
+		Payload: payload,
+	}, nil
+}
+
 type syncBuffer struct {
 	mu sync.Mutex
 	b  bytes.Buffer
@@ -86,6 +114,7 @@ type testPeer struct {
 	name   string
 	c      *Client
 	out    *syncBuffer
+	audio  *syncBuffer
 	cancel context.CancelFunc
 }
 
@@ -108,19 +137,29 @@ type room struct {
 }
 
 func newRoom(t *testing.T) *room {
-	var done atomic.Bool
-	t.Cleanup(func() { done.Store(true) })
 	srv := signaling.NewServer()
-	srv.Logf = logger(t, &done, "server")
+	srv.Logf = logger(t, "server")
 	hs := httptest.NewServer(srv.Handler())
 	t.Cleanup(func() { hs.Close(); srv.Close() })
 	r := &room{t: t, wsURL: "ws" + strings.TrimPrefix(hs.URL, "http") + "/ws", src: &synthSource{gop: 600}}
 	return r
 }
 
-func logger(t *testing.T, done *atomic.Bool, name string) func(string, ...any) {
+// logger returns a Logf for background goroutines. Once the test's cleanup
+// starts, logging stops; the lock guarantees no call is half-way through
+// t.Logf when the test is marked finished (which the race detector flags).
+func logger(t *testing.T, name string) func(string, ...any) {
+	var mu sync.Mutex
+	done := false
+	t.Cleanup(func() {
+		mu.Lock()
+		done = true
+		mu.Unlock()
+	})
 	return func(f string, a ...any) {
-		if !done.Load() {
+		mu.Lock()
+		defer mu.Unlock()
+		if !done {
 			t.Logf(time.Now().Format("05.000")+" ["+name+"] "+f, a...)
 		}
 	}
@@ -128,17 +167,15 @@ func logger(t *testing.T, done *atomic.Bool, name string) func(string, ...any) {
 
 func (r *room) start(name string, cfg Config) *testPeer {
 	t := r.t
-	var done atomic.Bool
-	t.Cleanup(func() { done.Store(true) })
 	cfg.ServerURL, cfg.Room, cfg.Name = r.wsURL, "test", name
 	cfg.IncludeLoopback = true
-	cfg.Logf = logger(t, &done, name)
+	cfg.Logf = logger(t, name)
 	tp := &testPeer{name: name}
 	if cfg.Role == proto.RoleViewer {
-		tp.out = &syncBuffer{}
-		cfg.Output = tp.out
+		tp.out, tp.audio = &syncBuffer{}, &syncBuffer{}
+		cfg.Output, cfg.AudioOutput = tp.out, tp.audio
 	} else {
-		cfg.Source = r.src
+		cfg.Source, cfg.Audio = r.src, &synthAudio{}
 	}
 	c, err := New(cfg)
 	if err != nil {
@@ -168,9 +205,15 @@ func standardRoom(t *testing.T) (r *room, streamer, fiber, backup, plain *testPe
 		eventually(t, 10*time.Second, v.name+" receives a keyframe via supernode", func() bool {
 			return bytes.Contains(v.out.snapshot(), idrMarker)
 		})
+		eventually(t, 5*time.Second, v.name+" receives game audio via supernode", func() bool {
+			return bytes.Count(v.audio.snapshot(), audioMarker) >= 5
+		})
 	}
 	return
 }
+
+// audioCount is how many synthetic audio packets reached v's Ogg output.
+func audioCount(v *testPeer) int { return bytes.Count(v.audio.snapshot(), audioMarker) }
 
 func topoIs(host, backup string, peers ...*testPeer) func() bool {
 	return func() bool {
@@ -211,6 +254,11 @@ func TestFailoverWhenSupernodeHangs(t *testing.T) {
 	if took > 1500*time.Millisecond {
 		t.Errorf("failover took %v, want < 1.5s", took)
 	}
+	// Audio switches with the video: ~25 packets in the next 500 ms.
+	before := audioCount(plain)
+	eventually(t, 2*time.Second, "game audio continues on plain after failover", func() bool {
+		return audioCount(plain)-before >= 20
+	})
 	// Warm backup took over; with no other capable viewer the streamer is now backup.
 	eventually(t, time.Second, "backup promoted", topoIs(backup.c.ID(), streamer.c.ID(), streamer, backup, plain))
 	// The new supernode's own player switches too. The keyframe it needs was
