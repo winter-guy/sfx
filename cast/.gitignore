@@ -1,8 +1,8 @@
-# Build output (go build -o bin/gamecast ./cmd/gamecast)
+# Build output (go build -o bin/cast ./cmd/cast)
 bin/
-# go build ./cmd/gamecast run from this directory drops the binary here
-/gamecast
-/gamecast.exe
+# go build ./cmd/cast run from this directory drops the binary here
+/cast
+/cast.exe
 
 # Test and profiling artifacts
 *.test

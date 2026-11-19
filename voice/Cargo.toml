@@ -1,0 +1,27 @@
+[package]
+name = "voice"
+version = "0.1.0"
+edition = "2024"
+description = "Voice chat audio engine for cast: mic capture, echo cancellation (sonora), Opus, jitter buffering, mixing and playback"
+publish = false
+
+[features]
+default = []
+# Build libopus from source and link it statically (needs cmake). Use this
+# for release / cross builds; the default links the system libopus.
+bundled = ["opusic-sys/bundled"]
+
+[dependencies]
+anyhow = "1.0.104"
+cpal = "0.18.2"
+opusic-sys = { version = "0.7.7", default-features = false }
+ringbuf = "0.4"
+sonora = "0.3.0"
+
+[build-dependencies]
+pkg-config = "0.3"
+
+# The DSP (sonora, libopus) is far too slow unoptimised; keep dependencies
+# optimised even in debug builds and tests.
+[profile.dev.package."*"]
+opt-level = 3

@@ -1,8 +1,8 @@
-// Command gamecast is a prototype of the supernode game-streaming core.
+// Command cast is a prototype of the supernode game-streaming core.
 //
-//	gamecast signal  -addr :8080
-//	gamecast stream  -server ws://HOST:8080/ws -room r -in -        < video.h264
-//	gamecast watch   -server ws://HOST:8080/ws -room r -host -out - | ffplay ...
+//	cast signal  -addr :8080
+//	cast stream  -server ws://HOST:8080/ws -room r -in -        < video.h264
+//	cast watch   -server ws://HOST:8080/ws -room r -host -out - | ffplay ...
 package main
 
 import (
@@ -13,16 +13,21 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/pion/webrtc/v4"
 
-	"gamecast/internal/peer"
-	"gamecast/internal/proto"
-	"gamecast/internal/signaling"
+	"cast/internal/peer"
+	"cast/internal/procstats"
+	"cast/internal/proto"
+	"cast/internal/signaling"
 )
 
 func main() {
@@ -49,20 +54,27 @@ func main() {
 	}
 }
 
+const (
+	defaultStatsEvery = 0 // diagnostics only when asked for
+	statsHelp         = "diagnostics: log this process's CPU, memory and goroutines this often, e.g. 5s (default off)"
+)
+
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
-  gamecast signal [-addr :8080]
-  gamecast stream -server ws://HOST:8080/ws -room NAME [-in -|file.h264] [flags]
-  gamecast watch  -server ws://HOST:8080/ws -room NAME [-host] [-out -|file.h264] [flags]
+  cast signal [-addr :8080]
+  cast stream -server ws://HOST:8080/ws -room NAME [-in -|file.h264] [flags]
+  cast watch  -server ws://HOST:8080/ws -room NAME [-host] [-out -|file.h264] [flags]
 
-run "gamecast <command> -h" for flags`)
+run "cast <command> -h" for flags`)
 	os.Exit(2)
 }
 
 func runSignal(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("signal", flag.ExitOnError)
 	addr := fs.String("addr", ":8080", "listen address")
+	stats := fs.Duration("stats", defaultStatsEvery, statsHelp)
 	_ = fs.Parse(args)
+	go procstats.Log(ctx, *stats, log.Printf)
 	srv := &http.Server{Addr: *addr, Handler: signaling.NewServer().Handler()}
 	go func() {
 		<-ctx.Done()
@@ -87,17 +99,30 @@ func runPeer(ctx context.Context, role string, args []string) error {
 	wired := fs.Bool("wired", false, "this PC is on wired Ethernet (preferred as supernode)")
 	ice := fs.String("ice", "stun:stun.l.google.com:19302", "comma-separated STUN/TURN URLs (turn:user:pass@host:port)")
 	loopback := fs.Bool("loopback", false, "allow 127.0.0.1 candidates (single-machine demo)")
+	stats := fs.Duration("stats", defaultStatsEvery, statsHelp)
 
 	// stream
 	in := fs.String("in", "-", "stream: H.264 Annex-B input ('-' = stdin, or a file)")
 	loop := fs.Bool("loop", false, "stream: replay -in file forever")
 	fps := fs.Int("fps", 60, "stream: frame rate")
 	bitrate := fs.Int("bitrate", signaling.DefaultBitrateKbps, "stream: encoder target kbps (used to size the supernode)")
+	audioIn := fs.String("audio-in", "", "stream: receive game audio as Opus RTP on this UDP address, e.g. 127.0.0.1:5004 ('' = no audio)")
+	audioKbps := fs.Int("audio-bitrate", 128, "stream: Opus bitrate in kbps (added to -bitrate when sizing the supernode)")
 
 	// watch
 	canHost := fs.Bool("host", false, "watch: volunteer this PC as supernode")
 	out := fs.String("out", "-", "watch: write received H.264 here ('-' = stdout, '' = discard)")
+	audioOut := fs.String("audio-out", "", "watch: write received game audio as Ogg/Opus here (file or named pipe; '-' = stdout if -out isn't; '' = none)")
+
+	// voice chat (both commands)
+	voice := fs.Bool("voice", false, "join voice chat (runs the voice sidecar)")
+	voiceBin := fs.String("voice-bin", "", "path to the voice sidecar binary (default: next to this binary, then $PATH)")
+	voiceIn := fs.String("voice-input", "default", "voice: microphone: default | sine:FREQ | silence")
+	voiceOut := fs.String("voice-output", "default", "voice: playback: default | raw:PATH | null")
+	voiceMuted := fs.Bool("voice-muted", false, "voice: start with the microphone muted")
+	voiceMicDelay := fs.Int("voice-mic-delay", -1, "voice: ms to hold the mic back before echo cancellation (-1 = sidecar default: 80 on the streamer, 0 on viewers)")
 	_ = fs.Parse(args)
+	go procstats.Log(ctx, *stats, log.Printf)
 
 	needUpload := role == proto.RoleStreamer || *canHost
 	if *upload == 0 && needUpload {
@@ -118,6 +143,34 @@ func runPeer(ctx context.Context, role string, args []string) error {
 		ICEServers:      parseICE(*ice),
 		IncludeLoopback: *loopback,
 		FPS:             *fps,
+	}
+
+	if role == proto.RoleStreamer && *audioIn != "" {
+		src, err := peer.ListenRTPAudio(*audioIn)
+		if err != nil {
+			return err
+		}
+		defer src.Close()
+		go func() { <-ctx.Done(); src.Close() }()
+		cfg.Audio = src
+		cfg.BitrateKbps += *audioKbps
+		log.Printf("game audio: listening for Opus RTP on %s", src.Addr())
+	}
+	if role == proto.RoleViewer && *audioOut != "" {
+		switch *audioOut {
+		case "-":
+			if *out == "-" {
+				return fmt.Errorf("-audio-out - and -out - can't both use stdout")
+			}
+			cfg.AudioOutput = os.Stdout
+		default:
+			f, err := os.Create(*audioOut)
+			if err != nil {
+				return err
+			}
+			defer f.Close()
+			cfg.AudioOutput = f
+		}
 	}
 
 	if role == proto.RoleStreamer {
@@ -158,6 +211,21 @@ func runPeer(ctx context.Context, role string, args []string) error {
 		}
 	}
 
+	if *voice {
+		bin, err := findVoiceBin(*voiceBin)
+		if err != nil {
+			return err
+		}
+		cfg.Voice = &peer.VoiceConfig{
+			Bin:   bin,
+			Args:  []string{"--input", *voiceIn, "--output", *voiceOut},
+			Muted: *voiceMuted,
+		}
+		if *voiceMicDelay >= 0 {
+			cfg.Voice.Args = append(cfg.Voice.Args, "--mic-delay", strconv.Itoa(*voiceMicDelay))
+		}
+	}
+
 	c, err := peer.New(cfg)
 	if err != nil {
 		return err
@@ -189,4 +257,26 @@ func parseICE(s string) []webrtc.ICEServer {
 func hostname() string {
 	h, _ := os.Hostname()
 	return h
+}
+
+// findVoiceBin locates the voice sidecar: the flag, then next to
+// this executable, then $PATH.
+func findVoiceBin(flagPath string) (string, error) {
+	if flagPath != "" {
+		return flagPath, nil
+	}
+	name := "voice"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	if exe, err := os.Executable(); err == nil {
+		p := filepath.Join(filepath.Dir(exe), name)
+		if _, err := os.Stat(p); err == nil {
+			return p, nil
+		}
+	}
+	if p, err := exec.LookPath(name); err == nil {
+		return p, nil
+	}
+	return "", fmt.Errorf("-voice: %s not found next to cast or in $PATH (build it with `cargo build --release` in voice/, or pass -voice-bin)", name)
 }

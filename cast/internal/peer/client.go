@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,7 +18,7 @@ import (
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
 
-	"gamecast/internal/proto"
+	"cast/internal/proto"
 )
 
 const (
@@ -47,8 +48,16 @@ type Config struct {
 	FPS    int  // nominal frame rate
 	Pace   bool // sleep 1/FPS between frames (for files); live encoders pace themselves
 
+	// Streamer: game audio (optional). Opus RTP packets, e.g. RTPAudioSource.
+	Audio AudioSource
+
 	// Viewer: received video as an Annex-B H.264 stream (pipe it to a player).
 	Output io.Writer
+	// Viewer: received game audio as an Ogg/Opus stream (optional).
+	AudioOutput io.Writer
+
+	// Voice chat (optional, any role): runs the voice sidecar.
+	Voice *VoiceConfig
 
 	Logf func(format string, args ...any)
 }
@@ -83,10 +92,24 @@ type Client struct {
 	sample *webrtc.TrackLocalStaticSample
 	idle   *webrtc.TrackLocalStaticSample
 	srcKF  *throttle
+	// Game audio, same live/standby scheme. Every link negotiates audio, so
+	// these exist even when the streamer has no audio source.
+	audio     *webrtc.TrackLocalStaticRTP
+	audioIdle *webrtc.TrackLocalStaticRTP
 
-	// Viewer: when host or backup, packets from the streamer are re-sent on fwd.
-	fwd *webrtc.TrackLocalStaticRTP
-	out *outputSink
+	// Viewer: when host or backup, packets from the streamer are re-sent on
+	// fwd / fwdAudio.
+	fwd      *webrtc.TrackLocalStaticRTP
+	fwdAudio *webrtc.TrackLocalStaticRTP
+	out      *outputSink
+	audioOut *audioSink
+
+	// Voice chat: mesh links (guarded by mu) and the sidecar.
+	voice        atomic.Pointer[voiceEngine]
+	voiceTrack   *webrtc.TrackLocalStaticRTP
+	vlinks       map[string]*link
+	wantVoice    map[string]bool
+	voicePending map[string]proto.Message
 
 	hung atomic.Bool // test hook: behave like a frozen process
 }
@@ -111,24 +134,43 @@ func New(cfg Config) (*Client, error) {
 		wantSend: map[string]bool{},
 		wantRecv: map[string]bool{},
 		pending:  map[string]proto.Message{},
+
+		vlinks:       map[string]*link{},
+		wantVoice:    map[string]bool{},
+		voicePending: map[string]proto.Message{},
+	}
+	if c.voiceTrack, err = webrtc.NewTrackLocalStaticRTP(OpusCapability, "voice", "cast-voice"); err != nil {
+		return nil, err
 	}
 	c.playFrom.Store("")
 	c.fwdFrom.Store("")
 	if cfg.Role == proto.RoleStreamer {
-		if c.sample, err = webrtc.NewTrackLocalStaticSample(H264Capability, "video", "gamecast"); err != nil {
+		if c.sample, err = webrtc.NewTrackLocalStaticSample(H264Capability, "video", "cast"); err != nil {
 			return nil, err
 		}
-		if c.idle, err = webrtc.NewTrackLocalStaticSample(H264Capability, "video", "gamecast"); err != nil {
+		if c.idle, err = webrtc.NewTrackLocalStaticSample(H264Capability, "video", "cast"); err != nil {
 			return nil, err
 		}
 		c.srcKF = newThrottle(keyframeMinInterval, cfg.Source.RequestKeyframe)
+		if c.audio, err = webrtc.NewTrackLocalStaticRTP(OpusCapability, "audio", "cast"); err != nil {
+			return nil, err
+		}
+		if c.audioIdle, err = webrtc.NewTrackLocalStaticRTP(OpusCapability, "audio", "cast"); err != nil {
+			return nil, err
+		}
 	} else {
-		if c.fwd, err = webrtc.NewTrackLocalStaticRTP(H264Capability, "video", "gamecast"); err != nil {
+		if c.fwd, err = webrtc.NewTrackLocalStaticRTP(H264Capability, "video", "cast"); err != nil {
+			return nil, err
+		}
+		if c.fwdAudio, err = webrtc.NewTrackLocalStaticRTP(OpusCapability, "audio", "cast"); err != nil {
 			return nil, err
 		}
 	}
 	if cfg.Output != nil {
 		c.out = &outputSink{w: cfg.Output}
+	}
+	if cfg.AudioOutput != nil {
+		c.audioOut = newAudioSink(cfg.AudioOutput, cfg.Logf)
 	}
 	return c, nil
 }
@@ -175,10 +217,26 @@ func (c *Client) Run(ctx context.Context) error {
 		conn.Close()
 	}()
 
+	if c.cfg.Voice != nil {
+		// The streamer hears the game through the OS already: its sidecar
+		// only uses game audio as echo reference.
+		gameMode := "play"
+		if c.cfg.Role == proto.RoleStreamer {
+			gameMode = "reference"
+		}
+		v, err := startVoice(*c.cfg.Voice, gameMode, c.cfg.Logf)
+		if err != nil {
+			return err
+		}
+		c.voice.Store(v)
+		defer v.close()
+		go c.pumpMic(v)
+	}
+
 	join := proto.Join{
 		Room: c.cfg.Room, Role: c.cfg.Role, Name: c.cfg.Name,
 		UploadMbps: c.cfg.UploadMbps, Wired: c.cfg.Wired, CanHost: c.cfg.CanHost,
-		BitrateKbps: c.cfg.BitrateKbps,
+		BitrateKbps: c.cfg.BitrateKbps, Voice: c.cfg.Voice != nil,
 	}
 	if err := c.send(proto.Message{Type: proto.TypeJoin, Join: &join}); err != nil {
 		return err
@@ -186,6 +244,9 @@ func (c *Client) Run(ctx context.Context) error {
 
 	if c.cfg.Role == proto.RoleStreamer {
 		go c.pumpFrames(ctx)
+		if c.cfg.Audio != nil {
+			go c.pumpAudio(ctx)
+		}
 	}
 	go c.statusLoop(ctx)
 
@@ -259,6 +320,26 @@ func (c *Client) pumpFrames(ctx context.Context) {
 	}
 }
 
+// pumpAudio moves Opus packets from the audio source onto the shared audio
+// track. Like video, each packet is sent once per live link, never re-encoded.
+func (c *Client) pumpAudio(ctx context.Context) {
+	for ctx.Err() == nil {
+		p, err := c.cfg.Audio.NextPacket()
+		if err != nil {
+			if ctx.Err() == nil {
+				c.cfg.Logf("audio source: %v", err)
+			}
+			return
+		}
+		_ = c.audio.WriteRTP(p)
+		if v := c.voice.Load(); v != nil {
+			if b, err := p.Marshal(); err == nil {
+				v.sendGame(b) // echo reference for the streamer's own mic
+			}
+		}
+	}
+}
+
 // statusLoop is the heartbeat the server uses to detect a failed host.
 func (c *Client) statusLoop(ctx context.Context) {
 	t := time.NewTicker(statusInterval)
@@ -321,6 +402,7 @@ func (c *Client) applyTopology(t proto.Topology) {
 			t.Version, c.roleLocked(t), t.Host, t.Backup, t.Degraded, t.Reason)
 	}
 	c.reconcileLocked(t, prev)
+	c.reconcileVoiceLocked(t)
 	cbs := append([]func(proto.Topology){}, c.onChange...)
 	c.mu.Unlock()
 	for _, f := range cbs {
@@ -440,6 +522,10 @@ func (c *Client) reconcileLocked(t proto.Topology, prev *proto.Topology) {
 func (c *Client) handleSignal(m proto.Message) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if strings.HasPrefix(m.Link, "voice/") {
+		c.handleVoiceSignalLocked(m)
+		return
+	}
 	switch m.Signal.Kind {
 	case "offer":
 		if !c.wantRecv[m.From] {
@@ -467,6 +553,10 @@ func (c *Client) closeAll() {
 	for key, l := range c.links {
 		l.close()
 		delete(c.links, key)
+	}
+	for p, l := range c.vlinks {
+		l.close()
+		delete(c.vlinks, p)
 	}
 }
 
