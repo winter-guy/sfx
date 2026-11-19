@@ -13,18 +13,18 @@ import (
 	"testing"
 	"time"
 
-	"gamecast/internal/proto"
+	"cast/internal/proto"
 )
 
-// voiceBin finds the gamecast-voice sidecar, or skips the test.
+// voiceBin finds the voice sidecar, or skips the test.
 func voiceBin(t *testing.T) string {
 	t.Helper()
-	if p := os.Getenv("GAMECAST_VOICE_BIN"); p != "" {
+	if p := os.Getenv("CAST_VOICE_BIN"); p != "" {
 		return p
 	}
-	p, _ := filepath.Abs("../../voice/target/debug/gamecast-voice")
+	p, _ := filepath.Abs("../../../voice/target/debug/voice")
 	if _, err := os.Stat(p); err != nil {
-		t.Skip("voice sidecar not built: run `cargo build` in voice/ or set GAMECAST_VOICE_BIN")
+		t.Skip("voice sidecar not built: run `cargo build` in voice/ or set CAST_VOICE_BIN")
 	}
 	return p
 }

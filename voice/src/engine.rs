@@ -5,7 +5,7 @@
 //!  voices (Opus RTP, per SSRC) ─▶ jitter ─▶┐
 //!  game audio (Opus RTP) ────────▶ jitter ─▶┼▶ mix ─▶ speakers
 //!                                          └──────▶ AEC render reference
-//!  microphone ─▶ AEC + noise suppression + AGC ─▶ Opus ─▶ RTP ─▶ gamecast
+//!  microphone ─▶ AEC + noise suppression + AGC ─▶ Opus ─▶ RTP ─▶ cast
 //! ```
 
 use std::collections::{HashMap, VecDeque};

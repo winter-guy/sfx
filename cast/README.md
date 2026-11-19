@@ -1,11 +1,11 @@
-# gamecast
+# cast
 
 **Low-latency game streaming to a small group, with no media server.**
 
-gamecast streams a game from one PC to a small group of friends (about 10 people)
+cast streams a game from one PC to a small group of friends (about 10 people)
 as H.264 1080p60 with Opus game audio over WebRTC, with voice chat between
 everyone in the room. A streamer's home connection usually can't send 9 copies of a 1080p60
-stream, so gamecast elects a **supernode**: one viewer on a fast connection
+stream, so cast elects a **supernode**: one viewer on a fast connection
 receives the stream once and forwards it to everyone else. Any client can be
 elected, because every client runs the same forwarding code. A **warm backup** takes over in
 about half a second if the supernode freezes or disappears.
@@ -108,7 +108,7 @@ It never touches video.
 ```
                     ┌──────────────────────────────┐
                     │       signaling server       │   rooms, election,
-                    │  (gamecast signal, no media) │   health monitor, SDP relay
+                    │  (cast signal, no media) │   health monitor, SDP relay
                     └──────────────┬───────────────┘
                                    │ WebSocket (JSON)
         ┌──────────────────────────┼──────────────────────────────┐
@@ -126,9 +126,9 @@ It never touches video.
 
 | Component | Command | What it does |
 |---|---|---|
-| Signaling server | `gamecast signal` | Tracks rooms and peers, elects the supernode and backup, watches the supernode's health, relays SDP offers/answers, serves an upload speed test. Never handles media. |
-| Streamer | `gamecast stream` | Reads encoded H.264 frames (currently from an ffmpeg pipe) and, optionally, Opus game audio (RTP on a local UDP port). Sends both on its live links. |
-| Viewer | `gamecast watch` | Receives the stream and writes video (H.264) and audio (Ogg/Opus) out for playback (currently ffplay). It may be elected supernode or backup. |
+| Signaling server | `cast signal` | Tracks rooms and peers, elects the supernode and backup, watches the supernode's health, relays SDP offers/answers, serves an upload speed test. Never handles media. |
+| Streamer | `cast stream` | Reads encoded H.264 frames (currently from an ffmpeg pipe) and, optionally, Opus game audio (RTP on a local UDP port). Sends both on its live links. |
+| Viewer | `cast watch` | Receives the stream and writes video (H.264) and audio (Ogg/Opus) out for playback (currently ffplay). It may be elected supernode or backup. |
 
 ### Roles
 
@@ -137,7 +137,7 @@ The server assigns roles each time the room changes. Roles are announced in a
 
 | Role | Who | Responsibility |
 |---|---|---|
-| **Streamer** | The one `gamecast stream` in the room | Source of the stream. Sends to the host (and holds a standby link to the backup). |
+| **Streamer** | The one `cast stream` in the room | Source of the stream. Sends to the host (and holds a standby link to the backup). |
 | **Host** (supernode) | The streamer itself, or a viewer that opted in with `-host` | Receives from the streamer and forwards to every other viewer. |
 | **Backup** | Another opted-in viewer, or the streamer | Pre-connected warm standby. Takes over instantly if the host fails. |
 | **Viewer** | Everyone else | Plays the stream from the host. |
@@ -172,7 +172,7 @@ the streamer disappears, there is no stream to save.
 
 All peers negotiate exactly one video codec (H.264, packetization mode 1,
 payload type 102) and one audio codec (Opus, payload type 111). Every link
-negotiates audio even when the streamer has no audio input. Both ends are always gamecast, so the SDP profile string is pinned. The
+negotiates audio even when the streamer has no audio input. Both ends are always cast, so the SDP profile string is pinned. The
 bitstream itself can be any profile the encoder produces, because it is
 forwarded as-is.
 
@@ -308,11 +308,11 @@ viewer ──PLI──▶ supernode ──PLI──▶ streamer ──▶ encode
 
 ### Voice chat
 
-Voice is split between two processes. **gamecast (Go)** carries the packets;
-the **gamecast-voice sidecar (Rust)** does all the audio work:
+Voice is split between two processes. **cast (Go)** carries the packets;
+the **voice sidecar (Rust)** does all the audio work:
 
 ```
-            gamecast (Go)                          gamecast-voice (Rust sidecar)
+            cast (Go)                          voice (Rust sidecar)
   ┌───────────────────────────────┐   UDP   ┌──────────────────────────────────────┐
   │ voice mesh: 1 PeerConnection  │ ◀────── │ mic ─▶ sonora: echo cancel, noise   │
   │ per pair of voice peers,      │  Opus   │        suppression, AGC ─▶ Opus 32k │
@@ -342,8 +342,8 @@ the **gamecast-voice sidecar (Rust)** does all the audio work:
   ALSA), resampled to 48 kHz as needed.
 - **Process protocol:** the sidecar prints one handshake line on stdout
   (`READY voice=127.0.0.1:P game=127.0.0.1:Q`), takes `mute`, `unmute` and `quit`
-  on stdin, quits when stdin closes (so it never outlives gamecast), and logs to
-  stderr, which gamecast forwards to its own log.
+  on stdin, quits when stdin closes (so it never outlives cast), and logs to
+  stderr, which cast forwards to its own log.
 - **Mute** from Go: `Client.SetVoiceMuted(bool)`; from the CLI: `-voice-muted`
   at startup.
 
@@ -429,14 +429,14 @@ last decade), with at least 10 Mbps download.
 ### Build
 
 ```sh
-cd gamecast
-go build -o bin/gamecast ./cmd/gamecast
+cd cast
+go build -o bin/cast ./cmd/cast
 
-# Voice chat sidecar (optional). gamecast looks for it next to its own binary.
-(cd voice && cargo build --release) && cp voice/target/release/gamecast-voice bin/
+# Voice chat sidecar (optional). cast looks for it next to its own binary.
+(cd ../voice && cargo build --release) && cp ../voice/target/release/voice bin/
 
 go test -race ./...                 # voice tests are skipped if the sidecar isn't built
-(cd voice && cargo test)
+(cd ../voice && cargo test)
 ```
 
 ### Try it on one machine
@@ -453,20 +453,20 @@ ffmpeg -f lavfi -i testsrc2=size=1920x1080:rate=60 -t 20 \
   -f h264 test.h264
 
 # 2. Signaling server
-./bin/gamecast signal -addr 127.0.0.1:8080
+./bin/cast signal -addr 127.0.0.1:8080
 
 # 3. Streamer, replaying the clip forever, reporting weak upload so a supernode is needed
-./bin/gamecast stream -server ws://127.0.0.1:8080/ws -room demo -loopback -ice= \
+./bin/cast stream -server ws://127.0.0.1:8080/ws -room demo -loopback -ice= \
   -in test.h264 -loop -upload 10
 
 # 4. A viewer that volunteers as supernode
-./bin/gamecast watch -server ws://127.0.0.1:8080/ws -room demo -loopback -ice= \
+./bin/cast watch -server ws://127.0.0.1:8080/ws -room demo -loopback -ice= \
   -host -upload 200 -wired -out - | ffplay -fflags nobuffer -flags low_delay -framedrop -f h264 -
 
 # 5. A backup and a plain viewer
-./bin/gamecast watch -server ws://127.0.0.1:8080/ws -room demo -loopback -ice= \
+./bin/cast watch -server ws://127.0.0.1:8080/ws -room demo -loopback -ice= \
   -host -upload 100 -out "" &
-./bin/gamecast watch -server ws://127.0.0.1:8080/ws -room demo -loopback -ice= \
+./bin/cast watch -server ws://127.0.0.1:8080/ws -room demo -loopback -ice= \
   -out - | ffplay -fflags nobuffer -flags low_delay -framedrop -f h264 -
 ```
 
@@ -474,7 +474,7 @@ ffmpeg -f lavfi -i testsrc2=size=1920x1080:rate=60 -t 20 \
 and feed it Opus RTP:
 
 ```sh
-./bin/gamecast stream -server ws://127.0.0.1:8080/ws -room demo -loopback -ice= \
+./bin/cast stream -server ws://127.0.0.1:8080/ws -room demo -loopback -ice= \
   -in test.h264 -loop -upload 10 -audio-in 127.0.0.1:5004
 
 ffmpeg -re -f lavfi -i "sine=frequency=440:sample_rate=48000" -ac 2 \
@@ -483,12 +483,12 @@ ffmpeg -re -f lavfi -i "sine=frequency=440:sample_rate=48000" -ac 2 \
 ```
 
 Then have a viewer write audio to a named pipe that ffplay reads (macOS/Linux).
-Start ffplay first; gamecast waits until the pipe has a reader:
+Start ffplay first; cast waits until the pipe has a reader:
 
 ```sh
 mkfifo audio.ogg
 ffplay -nodisp -fflags nobuffer audio.ogg &
-./bin/gamecast watch -server ws://127.0.0.1:8080/ws -room demo -loopback -ice= \
+./bin/cast watch -server ws://127.0.0.1:8080/ws -room demo -loopback -ice= \
   -out - -audio-out audio.ogg | ffplay -fflags nobuffer -flags low_delay -framedrop -f h264 -
 ```
 
@@ -499,9 +499,9 @@ stdout (`-audio-out -`) and video to a file.
 Bob's playback is recorded to a raw file, so no devices or permissions are needed:
 
 ```sh
-./bin/gamecast watch -server ws://127.0.0.1:8080/ws -room demo -loopback -ice= \
+./bin/cast watch -server ws://127.0.0.1:8080/ws -room demo -loopback -ice= \
   -out "" -voice -voice-input sine:440 -voice-output null &
-./bin/gamecast watch -server ws://127.0.0.1:8080/ws -room demo -loopback -ice= \
+./bin/cast watch -server ws://127.0.0.1:8080/ws -room demo -loopback -ice= \
   -out "" -voice -voice-input silence -voice-output raw:bob.raw
 
 ffplay -f f32le -ar 48000 -ch_layout stereo bob.raw   # Bob heard a 440 Hz tone
@@ -520,11 +520,11 @@ picture should continue through the backup, and the server log shows
    of the PCs with port 8080 forwarded.
 
    ```sh
-   gamecast signal -addr :8080
+   cast signal -addr :8080
    ```
 
 2. **Streamer:** one ffmpeg process captures the screen and system audio. It
-   pipes H.264 to gamecast and sends Opus as RTP to gamecast's audio port (see
+   pipes H.264 to cast and sends Opus as RTP to cast's audio port (see
    [Encoder settings](#encoder-settings) for other GPUs and Windows):
 
    ```sh
@@ -535,7 +535,7 @@ picture should continue through the backup, and the server log shows
      -b:v 8M -maxrate 12M -bf 0 -g 30 -f h264 pipe:1 \
      -map 0:a -c:a libopus -b:a 128k -application lowdelay \
      -f rtp -sdp_file audio.sdp rtp://127.0.0.1:5004 \
-   | gamecast stream -server ws://SIGNAL_HOST:8080/ws -room friday -audio-in 127.0.0.1:5004
+   | cast stream -server ws://SIGNAL_HOST:8080/ws -room friday -audio-in 127.0.0.1:5004
    ```
 
    `-sdp_file` matters: without it, ffmpeg prints the RTP session description to
@@ -548,14 +548,14 @@ picture should continue through the backup, and the server log shows
 3. **Viewers on fast, wired connections** volunteer as supernode:
 
    ```sh
-   gamecast watch -server ws://SIGNAL_HOST:8080/ws -room friday -host -wired -out - \
+   cast watch -server ws://SIGNAL_HOST:8080/ws -room friday -host -wired -out - \
    | ffplay -fflags nobuffer -flags low_delay -framedrop -f h264 -
    ```
 
 4. **Everyone else:**
 
    ```sh
-   gamecast watch -server ws://SIGNAL_HOST:8080/ws -room friday -out - \
+   cast watch -server ws://SIGNAL_HOST:8080/ws -room friday -out - \
    | ffplay -fflags nobuffer -flags low_delay -framedrop -f h264 -
    ```
 
@@ -571,22 +571,22 @@ with `-ice`. See [Networking and deployment](#networking-and-deployment).
 ## Command reference
 
 ```
-gamecast signal [-addr :8080]
-gamecast stream -server ws://HOST:8080/ws -room NAME [-in -|file.h264] [flags]
-gamecast watch  -server ws://HOST:8080/ws -room NAME [-host] [-out -|file.h264] [flags]
+cast signal [-addr :8080]
+cast stream -server ws://HOST:8080/ws -room NAME [-in -|file.h264] [flags]
+cast watch  -server ws://HOST:8080/ws -room NAME [-host] [-out -|file.h264] [flags]
 ```
 
 All commands stop cleanly on Ctrl-C / SIGTERM. Logs go to stderr; with
 `watch -out -`, stdout carries only video.
 
-### `gamecast signal`
+### `cast signal`
 
 | Flag | Default | Description |
 |---|---|---|
 | `-addr` | `:8080` | Listen address. Serves `/ws` (signaling) and `/speedtest`. |
 | `-stats` | off | Diagnostics: log this process's CPU, memory and goroutines at this interval, e.g. `5s`. |
 
-### `gamecast stream` and `gamecast watch`
+### `cast stream` and `cast watch`
 
 Both commands accept the same flag set. Flags marked *stream* or *watch* only
 apply to that command.
@@ -609,20 +609,20 @@ apply to that command.
 | `-audio-bitrate` | `128` | stream | Opus bitrate in kbps, added to `-bitrate` when sizing the supernode. Keep it in line with ffmpeg's `-b:a`. |
 | `-host` | `false` | watch | Volunteer this PC as supernode/backup. |
 | `-out` | `-` | watch | Where to write received H.264: `-` for stdout, a file path, or `""` to discard. |
-| `-voice` | `false` | both | Join voice chat. Starts the gamecast-voice sidecar; on viewers it also plays game audio. |
-| `-voice-bin` | auto | both | Path to `gamecast-voice`. Default: next to the gamecast binary, then `$PATH`. |
+| `-voice` | `false` | both | Join voice chat. Starts the voice sidecar; on viewers it also plays game audio. |
+| `-voice-bin` | auto | both | Path to the `voice` sidecar. Default: next to the `cast` binary, then `$PATH`. |
 | `-voice-input` | `default` | both | Microphone: `default`, `sine:FREQ` (test tone) or `silence`. |
 | `-voice-output` | `default` | both | Playback: `default` (speakers), `raw:PATH` (f32le 48 kHz stereo file) or `null`. |
 | `-voice-muted` | `false` | both | Start with the microphone muted. |
 | `-audio-out` | none | watch | Where to write received game audio as Ogg/Opus: a file, a named pipe, or `-` for stdout (only if `-out` isn't `-`). Empty = don't write audio. |
 
-### `gamecast-voice` (sidecar)
+### `voice` (sidecar)
 
-Normally started by gamecast, but it can be run alone for diagnosis:
+Normally started by cast, but it can be run alone for diagnosis:
 
 ```
-gamecast-voice --send HOST:PORT [options]
-gamecast-voice --list-devices          # show the default devices, without opening them
+voice --send HOST:PORT [options]
+voice --list-devices          # show the default devices, without opening them
 ```
 
 | Flag | Default | Description |
@@ -649,7 +649,7 @@ These settings matter more than anything else for latency and failover speed:
 |---|---|---|
 | B-frames | **`-bf 0`** | B-frames reorder frames and add a frame or more of delay. |
 | Keyframe interval | **`-g 30`** (0.5 s at 60 fps) | A piped encoder can't be asked for keyframes, so this interval caps how fast new viewers and failovers get a picture. |
-| Bitrate | `-b:v 8M -maxrate 12M` | 8 Mbps for 1080p60 H.264; peaks capped at 1.5×. Match `gamecast stream -bitrate`. |
+| Bitrate | `-b:v 8M -maxrate 12M` | 8 Mbps for 1080p60 H.264; peaks capped at 1.5×. Match `cast stream -bitrate`. |
 | Rate control | CBR or capped VBR | Predictable bandwidth for the supernode. |
 | Output | `-f h264 -` | Raw Annex-B H.264 on stdout. |
 
@@ -674,16 +674,16 @@ ffmpeg -f lavfi -i ddagrab=framerate=60 -c:v h264_qsv -preset veryfast \
   -b:v 8M -maxrate 12M -bf 0 -g 30 -f h264 -
 ```
 
-Pipe any of these into `gamecast stream -server … -room …`.
+Pipe any of these into `cast stream -server … -room …`.
 
 ### Game audio
 
 | Setting | Value | Why |
 |---|---|---|
-| Codec | `-c:a libopus` | The only audio codec gamecast negotiates |
+| Codec | `-c:a libopus` | The only audio codec cast negotiates |
 | Bitrate | `-b:a 128k` | Good quality for game audio; match `-audio-bitrate` |
 | Mode | `-application lowdelay` | Lowest-latency Opus mode |
-| Output | `-f rtp -sdp_file audio.sdp rtp://127.0.0.1:5004` | RTP to gamecast's `-audio-in`; `-sdp_file` keeps the SDP out of stdout |
+| Output | `-f rtp -sdp_file audio.sdp rtp://127.0.0.1:5004` | RTP to cast's `-audio-in`; `-sdp_file` keeps the SDP out of stdout |
 
 Add the audio output to the same ffmpeg command as the video, with `-map` to
 pick streams. Windows example with an audio capture device:
@@ -694,7 +694,7 @@ ffmpeg -f lavfi -i ddagrab=framerate=60 -f dshow -i audio="Stereo Mix (Realtek(R
   -bf 0 -g 30 -f h264 pipe:1 \
   -map 1:a -c:a libopus -b:a 128k -application lowdelay \
   -f rtp -sdp_file audio.sdp rtp://127.0.0.1:5004 \
-| gamecast stream -server … -room … -audio-in 127.0.0.1:5004
+| cast stream -server … -room … -audio-in 127.0.0.1:5004
 ```
 
 Why RTP over local UDP for audio input? The video already uses stdin, and UDP
@@ -725,7 +725,7 @@ discover their public addresses. Peers behind **symmetric NAT** or strict
 firewalls (some corporate, university and mobile networks) need a **TURN** relay:
 
 ```sh
-gamecast watch … -ice "stun:stun.l.google.com:19302,turn:user:pass@turn.example.com:3478"
+cast watch … -ice "stun:stun.l.google.com:19302,turn:user:pass@turn.example.com:3478"
 ```
 
 TURN relays traffic through a server, which costs that server bandwidth. A
@@ -864,7 +864,7 @@ viewers, everything on one machine:
 | Role | CPU (share of one core) | Memory (peak RSS) |
 |---|---|---|
 | Signaling server | 0.5% | 13 MB |
-| Streamer (gamecast only; the encoder is extra) | 6% | 22 MB |
+| Streamer (cast only; the encoder is extra) | 6% | 22 MB |
 | **Supernode** (forwarding to 7 viewers) | **16%** | 50 MB |
 | Backup (standby) | 9% | 25 MB |
 | Viewer | 8% | 20 MB |
@@ -891,7 +891,7 @@ GOOS=windows go vet ./...                # check the Windows build
 | Audio in the integration tests | Every viewer receives game audio through the supernode; after a supernode hang, audio resumes through the backup |
 | `TestVoiceChatEchoCancellationEndToEnd` | Real sidecars in two viewers: B hears A; with B's speakers leaking into its mic, A's echo comes back ≥ 20 dB quieter with echo cancellation than without (measured 64 dB); muting A silences it at B |
 | `TestVoiceSidecarGetsGameAudio` | Game audio is forwarded to the sidecar (≥ 50 packets in 2 s) |
-| Rust: `cargo test` in `voice/` | RTP parsing; Opus round trip; jitter buffer ordering, wrap-around, loss concealment, late packets, latency cap; resampling; mixing and mute; echo cancellation in a simulated room (measured 76 dB reduction) |
+| Rust: `cargo test` in `../voice/` | RTP parsing; Opus round trip; jitter buffer ordering, wrap-around, loss concealment, late packets, latency cap; resampling; mixing and mute; echo cancellation in a simulated room (measured 76 dB reduction) |
 | `TestSampleSeesCPUAndMemory` | `-stats` reports CPU under load, drops when idle, and reports memory |
 
 The integration tests run a real signaling server and real WebRTC peers in one
@@ -899,8 +899,8 @@ process over loopback, with a synthetic H.264 source and a synthetic Opus source
 20 ms packets). The H.264 source has valid NAL framing with
 SPS/PPS/IDR and P-frames, and keyframes larger than the MTU so fragmentation is
 exercised. They check the bytes that reach each viewer's video and audio outputs. The
-voice tests run the real `gamecast-voice` binary (from `voice/target/debug`, or
-`GAMECAST_VOICE_BIN`) and are skipped if it hasn't been built. They measure
+voice tests run the real `voice` binary (from `../voice/target/debug`, or
+`CAST_VOICE_BIN`) and are skipped if it hasn't been built. They measure
 tones in the recorded playback with a Goertzel filter.
 
 ---
@@ -908,8 +908,8 @@ tones in the recorded playback with a Goertzel filter.
 ## Project layout
 
 ```
-gamecast/
-├── cmd/gamecast/main.go            CLI: signal / stream / watch, flags, shutdown
+cast/
+├── cmd/cast/main.go            CLI: signal / stream / watch, flags, shutdown
 └── internal/
     ├── proto/proto.go              JSON wire messages
     ├── signaling/
@@ -929,7 +929,7 @@ gamecast/
     │   └── voice_test.go           End-to-end voice tests with the real sidecar
     └── procstats/                  Process CPU / memory / goroutine sampling (Unix + Windows)
 
-voice/                              gamecast-voice: the Rust voice sidecar
+../voice/                           voice: the Rust voice sidecar (sibling of cast/)
 ├── Cargo.toml                      sonora, cpal, opusic-sys (libopus), ringbuf
 ├── build.rs                        Finds the system libopus via pkg-config
 └── src/
@@ -959,7 +959,7 @@ voice/                              gamecast-voice: the Rust voice sidecar
 
 | Option | Why not (for this use case) |
 |---|---|
-| Mesh (streamer sends to everyone) | 1080p60 to 9 viewers needs about 94 Mbps of upload; most streamers don't have it. gamecast still uses this when the streamer qualifies. |
+| Mesh (streamer sends to everyone) | 1080p60 to 9 viewers needs about 94 Mbps of upload; most streamers don't have it. cast still uses this when the streamer qualifies. |
 | SFU (media server) | Works well, but needs a server and bandwidth bills (about 30 GB per hour for 9 viewers). The supernode is an SFU that runs on a viewer's PC instead. |
 | CDN / HLS | Adds 2–30 s of delay; too slow for friends watching together over voice. |
 | Relay tree (several viewers relay) | More failure points and more hops for similar savings. The supernode is a one-level tree. |
@@ -1079,7 +1079,7 @@ This is a prototype. **Don't expose it to untrusted users yet.**
 | No audio on viewers | Check the streamer logged `game audio: listening for Opus RTP on …` and that ffmpeg sends to that exact address. The viewer needs `-audio-out`. |
 | `audio input …: address already in use` | Another process uses the port (or port+1 is taken, which is only a warning). Pick another `-audio-in` port and match it in ffmpeg. |
 | A viewer hangs at startup with `-audio-out` on a named pipe | Opening a named pipe waits for a reader. Start ffplay on the pipe first. |
-| `-voice: gamecast-voice not found …` | Build the sidecar (`cargo build --release` in `voice/`) and copy it next to `gamecast`, or pass `-voice-bin`. |
+| `-voice: voice not found …` | Build the sidecar (`cargo build --release` in `../voice/`) and copy it next to `cast`, or pass `-voice-bin`. |
 | Sidecar fails to start: library not loaded / `libopus` | It links the system libopus. Install it, or build with `cargo build --release --features bundled`. |
 | `voice: error: no microphone found` | No default input device. Use `-voice-input silence` to listen only. |
 | Others hear themselves echo | The echo canceller needs a few seconds to adapt. Make sure game audio is played by the sidecar (`-voice`), not by a separate player, so it's in the echo reference. |

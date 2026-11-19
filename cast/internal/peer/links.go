@@ -10,7 +10,7 @@ import (
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media/h264writer"
 
-	"gamecast/internal/proto"
+	"cast/internal/proto"
 )
 
 // link is one PeerConnection carrying (or ready to carry) the stream in one

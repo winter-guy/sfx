@@ -13,8 +13,8 @@ import (
 
 	"github.com/pion/rtp"
 
-	"gamecast/internal/proto"
-	"gamecast/internal/signaling"
+	"cast/internal/proto"
+	"cast/internal/signaling"
 )
 
 // synthSource emits fake H.264 frames (valid NAL framing, junk payload) at

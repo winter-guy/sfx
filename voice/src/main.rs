@@ -1,8 +1,8 @@
-//! gamecast-voice: the voice chat audio engine, run as a sidecar by gamecast.
+//! voice: the voice chat audio engine, run as a sidecar by cast.
 //!
-//! gamecast (Go) carries voice over WebRTC; this process does the audio:
+//! cast (Go) carries voice over WebRTC; this process does the audio:
 //! microphone → echo cancellation / noise suppression / AGC (sonora) → Opus →
-//! RTP to gamecast, and RTP from gamecast (voices, game audio) → jitter
+//! RTP to cast, and RTP from cast (voices, game audio) → jitter
 //! buffers → mix → speakers.
 //!
 //! Protocol with the parent process:
@@ -28,8 +28,8 @@ use anyhow::{Context, Result, bail};
 
 use engine::{Engine, EngineConfig, FRAME, GameMode};
 
-const USAGE: &str = "usage: gamecast-voice --send HOST:PORT [options]
-       gamecast-voice --list-devices
+const USAGE: &str = "usage: voice --send HOST:PORT [options]
+       voice --list-devices
 
   --send ADDR        where to send mic audio (Opus RTP), e.g. 127.0.0.1:6000
   --input SPEC       default | sine:FREQ | silence          (default: default)

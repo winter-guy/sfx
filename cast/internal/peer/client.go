@@ -18,7 +18,7 @@ import (
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
 
-	"gamecast/internal/proto"
+	"cast/internal/proto"
 )
 
 const (
@@ -56,7 +56,7 @@ type Config struct {
 	// Viewer: received game audio as an Ogg/Opus stream (optional).
 	AudioOutput io.Writer
 
-	// Voice chat (optional, any role): runs the gamecast-voice sidecar.
+	// Voice chat (optional, any role): runs the voice sidecar.
 	Voice *VoiceConfig
 
 	Logf func(format string, args ...any)
@@ -139,30 +139,30 @@ func New(cfg Config) (*Client, error) {
 		wantVoice:    map[string]bool{},
 		voicePending: map[string]proto.Message{},
 	}
-	if c.voiceTrack, err = webrtc.NewTrackLocalStaticRTP(OpusCapability, "voice", "gamecast-voice"); err != nil {
+	if c.voiceTrack, err = webrtc.NewTrackLocalStaticRTP(OpusCapability, "voice", "cast-voice"); err != nil {
 		return nil, err
 	}
 	c.playFrom.Store("")
 	c.fwdFrom.Store("")
 	if cfg.Role == proto.RoleStreamer {
-		if c.sample, err = webrtc.NewTrackLocalStaticSample(H264Capability, "video", "gamecast"); err != nil {
+		if c.sample, err = webrtc.NewTrackLocalStaticSample(H264Capability, "video", "cast"); err != nil {
 			return nil, err
 		}
-		if c.idle, err = webrtc.NewTrackLocalStaticSample(H264Capability, "video", "gamecast"); err != nil {
+		if c.idle, err = webrtc.NewTrackLocalStaticSample(H264Capability, "video", "cast"); err != nil {
 			return nil, err
 		}
 		c.srcKF = newThrottle(keyframeMinInterval, cfg.Source.RequestKeyframe)
-		if c.audio, err = webrtc.NewTrackLocalStaticRTP(OpusCapability, "audio", "gamecast"); err != nil {
+		if c.audio, err = webrtc.NewTrackLocalStaticRTP(OpusCapability, "audio", "cast"); err != nil {
 			return nil, err
 		}
-		if c.audioIdle, err = webrtc.NewTrackLocalStaticRTP(OpusCapability, "audio", "gamecast"); err != nil {
+		if c.audioIdle, err = webrtc.NewTrackLocalStaticRTP(OpusCapability, "audio", "cast"); err != nil {
 			return nil, err
 		}
 	} else {
-		if c.fwd, err = webrtc.NewTrackLocalStaticRTP(H264Capability, "video", "gamecast"); err != nil {
+		if c.fwd, err = webrtc.NewTrackLocalStaticRTP(H264Capability, "video", "cast"); err != nil {
 			return nil, err
 		}
-		if c.fwdAudio, err = webrtc.NewTrackLocalStaticRTP(OpusCapability, "audio", "gamecast"); err != nil {
+		if c.fwdAudio, err = webrtc.NewTrackLocalStaticRTP(OpusCapability, "audio", "cast"); err != nil {
 			return nil, err
 		}
 	}

@@ -16,7 +16,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"gamecast/internal/proto"
+	"cast/internal/proto"
 )
 
 const (

@@ -13,19 +13,19 @@ import (
 
 	"github.com/pion/webrtc/v4"
 
-	"gamecast/internal/proto"
+	"cast/internal/proto"
 )
 
 // VoiceConfig enables voice chat. The audio work (mic capture, echo
 // cancellation, Opus, jitter buffering, mixing, playback) runs in the
-// gamecast-voice sidecar (Rust, sonora); gamecast carries the packets.
+// voice sidecar (Rust, sonora); cast carries the packets.
 type VoiceConfig struct {
-	Bin   string   // path to the gamecast-voice binary
+	Bin   string   // path to the voice sidecar binary
 	Args  []string // extra sidecar arguments, e.g. --input sine:440 --output null
 	Muted bool
 }
 
-// voiceEngine is a running gamecast-voice process.
+// voiceEngine is a running voice sidecar process.
 //
 //	sidecar mic ──Opus RTP──▶ mic (UDP) ──▶ voice track ──▶ every voice link
 //	voice links ──RTP──▶ voiceAddr (UDP) ──▶ sidecar jitter/mix/speakers
@@ -45,7 +45,7 @@ const voiceStartTimeout = 10 * time.Second
 
 func startVoice(cfg VoiceConfig, gameMode string, logf func(string, ...any)) (*voiceEngine, error) {
 	if cfg.Bin == "" {
-		return nil, errors.New("voice: no gamecast-voice binary configured")
+		return nil, errors.New("voice: no voice sidecar binary configured")
 	}
 	mic, err := ListenRTPAudio("127.0.0.1:0")
 	if err != nil {
@@ -104,10 +104,10 @@ func startVoice(cfg VoiceConfig, gameMode string, logf func(string, ...any)) (*v
 		}
 	case <-v.done:
 		mic.Close()
-		return nil, errors.New("voice: gamecast-voice exited during startup (see log above)")
+		return nil, errors.New("voice: sidecar exited during startup (see log above)")
 	case <-time.After(voiceStartTimeout):
 		v.close()
-		return nil, errors.New("voice: gamecast-voice didn't become ready")
+		return nil, errors.New("voice: sidecar didn't become ready")
 	}
 	if v.out, err = net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)}); err != nil {
 		v.close()

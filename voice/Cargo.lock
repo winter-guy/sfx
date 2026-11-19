@@ -252,18 +252,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gamecast-voice"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cpal",
- "opusic-sys",
- "pkg-config",
- "ringbuf",
- "sonora",
-]
-
-[[package]]
 name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -901,6 +889,18 @@ name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
+
+[[package]]
+name = "voice"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cpal",
+ "opusic-sys",
+ "pkg-config",
+ "ringbuf",
+ "sonora",
+]
 
 [[package]]
 name = "walkdir"

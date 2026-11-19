@@ -1,8 +1,8 @@
-// Command gamecast is a prototype of the supernode game-streaming core.
+// Command cast is a prototype of the supernode game-streaming core.
 //
-//	gamecast signal  -addr :8080
-//	gamecast stream  -server ws://HOST:8080/ws -room r -in -        < video.h264
-//	gamecast watch   -server ws://HOST:8080/ws -room r -host -out - | ffplay ...
+//	cast signal  -addr :8080
+//	cast stream  -server ws://HOST:8080/ws -room r -in -        < video.h264
+//	cast watch   -server ws://HOST:8080/ws -room r -host -out - | ffplay ...
 package main
 
 import (
@@ -23,10 +23,10 @@ import (
 
 	"github.com/pion/webrtc/v4"
 
-	"gamecast/internal/peer"
-	"gamecast/internal/procstats"
-	"gamecast/internal/proto"
-	"gamecast/internal/signaling"
+	"cast/internal/peer"
+	"cast/internal/procstats"
+	"cast/internal/proto"
+	"cast/internal/signaling"
 )
 
 func main() {
@@ -60,11 +60,11 @@ const (
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
-  gamecast signal [-addr :8080]
-  gamecast stream -server ws://HOST:8080/ws -room NAME [-in -|file.h264] [flags]
-  gamecast watch  -server ws://HOST:8080/ws -room NAME [-host] [-out -|file.h264] [flags]
+  cast signal [-addr :8080]
+  cast stream -server ws://HOST:8080/ws -room NAME [-in -|file.h264] [flags]
+  cast watch  -server ws://HOST:8080/ws -room NAME [-host] [-out -|file.h264] [flags]
 
-run "gamecast <command> -h" for flags`)
+run "cast <command> -h" for flags`)
 	os.Exit(2)
 }
 
@@ -114,8 +114,8 @@ func runPeer(ctx context.Context, role string, args []string) error {
 	audioOut := fs.String("audio-out", "", "watch: write received game audio as Ogg/Opus here (file or named pipe; '-' = stdout if -out isn't; '' = none)")
 
 	// voice chat (both commands)
-	voice := fs.Bool("voice", false, "join voice chat (runs the gamecast-voice sidecar)")
-	voiceBin := fs.String("voice-bin", "", "path to gamecast-voice (default: next to this binary, then $PATH)")
+	voice := fs.Bool("voice", false, "join voice chat (runs the voice sidecar)")
+	voiceBin := fs.String("voice-bin", "", "path to the voice sidecar binary (default: next to this binary, then $PATH)")
 	voiceIn := fs.String("voice-input", "default", "voice: microphone: default | sine:FREQ | silence")
 	voiceOut := fs.String("voice-output", "default", "voice: playback: default | raw:PATH | null")
 	voiceMuted := fs.Bool("voice-muted", false, "voice: start with the microphone muted")
@@ -254,13 +254,13 @@ func hostname() string {
 	return h
 }
 
-// findVoiceBin locates the gamecast-voice sidecar: the flag, then next to
+// findVoiceBin locates the voice sidecar: the flag, then next to
 // this executable, then $PATH.
 func findVoiceBin(flagPath string) (string, error) {
 	if flagPath != "" {
 		return flagPath, nil
 	}
-	name := "gamecast-voice"
+	name := "voice"
 	if runtime.GOOS == "windows" {
 		name += ".exe"
 	}
@@ -273,5 +273,5 @@ func findVoiceBin(flagPath string) (string, error) {
 	if p, err := exec.LookPath(name); err == nil {
 		return p, nil
 	}
-	return "", fmt.Errorf("-voice: %s not found next to gamecast or in $PATH (build it with `cargo build --release` in voice/, or pass -voice-bin)", name)
+	return "", fmt.Errorf("-voice: %s not found next to cast or in $PATH (build it with `cargo build --release` in voice/, or pass -voice-bin)", name)
 }

@@ -1,4 +1,4 @@
-// Package procstats reports what the gamecast process itself consumes:
+// Package procstats reports what the cast process itself consumes:
 // CPU, memory and goroutines. It has no cgo and no extra dependencies.
 package procstats
 

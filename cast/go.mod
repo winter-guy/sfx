@@ -1,4 +1,4 @@
-module gamecast
+module cast
 
 go 1.24.3
 

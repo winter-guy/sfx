@@ -1,0 +1,19 @@
+# Build output (go build -o bin/cast ./cmd/cast)
+bin/
+# go build ./cmd/cast run from this directory drops the binary here
+/cast
+/cast.exe
+
+# Test and profiling artifacts
+*.test
+*.out
+*.prof
+coverage.*
+
+# Recorded / sample video (viewer -out files, encoder dumps)
+*.h264
+*.264
+
+# Local workspace files
+go.work
+go.work.sum

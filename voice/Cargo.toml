@@ -1,8 +1,8 @@
 [package]
-name = "gamecast-voice"
+name = "voice"
 version = "0.1.0"
 edition = "2024"
-description = "Voice chat audio engine for gamecast: mic capture, echo cancellation (sonora), Opus, jitter buffering, mixing and playback"
+description = "Voice chat audio engine for cast: mic capture, echo cancellation (sonora), Opus, jitter buffering, mixing and playback"
 publish = false
 
 [features]
