@@ -3,7 +3,7 @@
 **Low-latency game streaming to a small group, with no media server.**
 
 gamecast streams a game from one PC to a small group of friends (about 10 people)
-as H.264 1080p60 over WebRTC. A streamer's home connection usually can't send 9 copies of a 1080p60
+as H.264 1080p60 with Opus game audio over WebRTC. A streamer's home connection usually can't send 9 copies of a 1080p60
 stream, so gamecast elects a **supernode**: one viewer on a fast connection
 receives the stream once and forwards it to everyone else. Any client can be
 elected, because every client runs the same forwarding code. A **warm backup** takes over in
@@ -13,9 +13,9 @@ The only server is a lightweight **signaling server** that coordinates peers.
 It never touches video.
 
 > **Status: working prototype.** The media core (election, forwarding, failover)
-> is implemented and covered by automated tests. Capture and playback currently
-> rely on `ffmpeg`/`ffplay`, there is no audio yet, and it has not yet been tested
-> between machines on different networks. See [Project status](#project-status).
+> and game audio are implemented and covered by automated tests. Capture and
+> playback currently rely on `ffmpeg`/`ffplay`, there is no voice chat yet, and it
+> has not yet been tested between machines on different networks. See [Project status](#project-status).
 
 ---
 
@@ -60,6 +60,8 @@ It never touches video.
   packets to every peer it serves.
 - **Forward without re-encoding.** The supernode passes RTP packets through
   untouched: no decode, no quality loss, little CPU.
+- **Game audio.** An Opus track travels the same links as the video, is
+  forwarded the same way and switches with it on failover.
 - **Automatic supernode election** based on upload bandwidth, wired vs Wi-Fi
   and opt-in, with a degraded mode when nobody qualifies.
 - **Sub-second failover.** A warm standby backup is pre-connected; switching is a
@@ -81,11 +83,12 @@ It never touches video.
 | RTP forwarding through the supernode | ✅ Done | Integration tests (synthetic H.264), real binaries |
 | Warm-standby failover | ✅ Done | Tests for hang, clean leave, and a streamer pause that must not trigger failover |
 | Keyframe requests (PLI) end to end | ✅ Done | Integration tests |
+| Game audio (Opus), incl. through failover | ✅ Done | Integration tests; real binaries with synthetic Opus RTP over UDP. Real ffmpeg audio and actual listening are untested |
 | Resource diagnostics (`-stats`) | ✅ Done | Unit test, real binaries |
 | Real video (ffmpeg capture → ffplay) | ⚠️ Untested | ffmpeg was not available on the development machine; tests use synthetic H.264 |
 | Peers on different networks (NAT, TURN) | ⚠️ Untested | Only tested over loopback |
 | Windows | ⚠️ Compiles only | Passes `go vet` for Windows, never run there |
-| Audio, native capture/encoding, in-app player, UI | ❌ Not started | See [Roadmap](#roadmap) |
+| Voice chat, native capture/encoding, in-app player, UI | ❌ Not started | See [Roadmap](#roadmap) |
 
 ---
 
@@ -115,8 +118,8 @@ It never touches video.
 | Component | Command | What it does |
 |---|---|---|
 | Signaling server | `gamecast signal` | Tracks rooms and peers, elects the supernode and backup, watches the supernode's health, relays SDP offers/answers, serves an upload speed test. Never handles media. |
-| Streamer | `gamecast stream` | Reads encoded H.264 frames (currently from an ffmpeg pipe), packetizes them once and sends them on its live links. |
-| Viewer | `gamecast watch` | Receives the stream and writes it out for playback (currently to ffplay). It may be elected supernode or backup. |
+| Streamer | `gamecast stream` | Reads encoded H.264 frames (currently from an ffmpeg pipe) and, optionally, Opus game audio (RTP on a local UDP port). Sends both on its live links. |
+| Viewer | `gamecast watch` | Receives the stream and writes video (H.264) and audio (Ogg/Opus) out for playback (currently ffplay). It may be elected supernode or backup. |
 
 ### Roles
 
@@ -150,8 +153,17 @@ the streamer disappears, there is no stream to save.
 4. **Retransmissions are local.** NACK handling runs on each link, so a lost
    packet on a viewer's connection is re-sent by the supernode, not by the streamer.
 
-All peers negotiate exactly one codec: H.264, packetization mode 1, payload type
-102. Both ends are always gamecast, so the SDP profile string is pinned. The
+5. **Game audio rides along.** Every link carries a second track: Opus,
+   48 kHz stereo. The streamer forwards Opus RTP packets from its encoder as-is
+   (one packet per 10–20 ms). The supernode forwards them like video. Live/standby
+   swaps and failover switch audio and video together. Each viewer writes one
+   continuous Ogg/Opus stream; positions in it come from the Opus packets
+   themselves, so a supernode switch only leaves a gap equal to the failover
+   time.
+
+All peers negotiate exactly one video codec (H.264, packetization mode 1,
+payload type 102) and one audio codec (Opus, payload type 111). Every link
+negotiates audio even when the streamer has no audio input. Both ends are always gamecast, so the SDP profile string is pinned. The
 bitstream itself can be any profile the encoder produces, because it is
 forwarded as-is.
 
@@ -184,6 +196,8 @@ upload ≥ 1.3 × bitrate × copies it must send
 ```
 
 - `1.3` is headroom for packet overhead, retransmissions and action-scene peaks.
+- `bitrate` is the video bitrate plus the audio bitrate when the streamer has
+  audio (8000 + 128 kbps by default).
 - The streamer as host sends **N** copies (one per viewer).
 - A viewer as host sends **N − 1** copies, because it's also a viewer.
 
@@ -294,8 +308,17 @@ viewer ──PLI──▶ supernode ──PLI──▶ streamer ──▶ encode
 
 ### To run (for now)
 
-- **ffmpeg** on the streamer, to capture and hardware-encode the screen
-- **ffplay** (part of ffmpeg) on viewers, to display the stream
+- **ffmpeg** on the streamer, to capture and hardware-encode the screen, and to
+  encode game audio to Opus
+- **ffplay** (part of ffmpeg) on viewers, to display the video and play the audio
+- **For game audio, a way to capture system audio:** ffmpeg can't record what
+  your PC plays out of the box.
+  - **macOS:** a virtual loopback device, such as BlackHole
+  - **Windows:** "Stereo Mix" (if your sound driver has it) or a virtual audio
+    capture device
+  - **Linux:** the PulseAudio/PipeWire monitor source
+
+  Native capture (WASAPI loopback / ScreenCaptureKit) is on the roadmap.
 
 ### Streamer
 
@@ -389,6 +412,31 @@ ffmpeg -f lavfi -i testsrc2=size=1920x1080:rate=60 -t 20 \
   -out - | ffplay -fflags nobuffer -flags low_delay -framedrop -f h264 -
 ```
 
+**With game audio** (a 440 Hz test tone), restart the streamer with `-audio-in`
+and feed it Opus RTP:
+
+```sh
+./bin/gamecast stream -server ws://127.0.0.1:8080/ws -room demo -loopback -ice= \
+  -in test.h264 -loop -upload 10 -audio-in 127.0.0.1:5004
+
+ffmpeg -re -f lavfi -i "sine=frequency=440:sample_rate=48000" -ac 2 \
+  -c:a libopus -b:a 128k -application lowdelay \
+  -f rtp -sdp_file audio.sdp rtp://127.0.0.1:5004
+```
+
+Then have a viewer write audio to a named pipe that ffplay reads (macOS/Linux).
+Start ffplay first; gamecast waits until the pipe has a reader:
+
+```sh
+mkfifo audio.ogg
+ffplay -nodisp -fflags nobuffer audio.ogg &
+./bin/gamecast watch -server ws://127.0.0.1:8080/ws -room demo -loopback -ice= \
+  -out - -audio-out audio.ogg | ffplay -fflags nobuffer -flags low_delay -framedrop -f h264 -
+```
+
+On Windows, write audio to a file (`-audio-out game.ogg`), or send audio to
+stdout (`-audio-out -`) and video to a file.
+
 To see failover, freeze the supernode with `kill -STOP <pid>`. The plain viewer's
 picture should continue through the backup, and the server log shows
 `host … declared failed`.
@@ -402,16 +450,24 @@ picture should continue through the backup, and the server log shows
    gamecast signal -addr :8080
    ```
 
-2. **Streamer:** pipe a hardware-encoded capture into gamecast (see
-   [Encoder settings](#encoder-settings) for other GPUs):
+2. **Streamer:** one ffmpeg process captures the screen and system audio. It
+   pipes H.264 to gamecast and sends Opus as RTP to gamecast's audio port (see
+   [Encoder settings](#encoder-settings) for other GPUs and Windows):
 
    ```sh
-   # macOS (find the screen index with: ffmpeg -f avfoundation -list_devices true -i "")
-   ffmpeg -f avfoundation -framerate 60 -capture_cursor 1 -i "1:none" \
-     -vf scale=1920:1080 -c:v h264_videotoolbox -realtime 1 \
-     -b:v 8M -maxrate 12M -bf 0 -g 30 -f h264 - \
-   | gamecast stream -server ws://SIGNAL_HOST:8080/ws -room friday
+   # macOS with the BlackHole loopback device
+   # (list devices with: ffmpeg -f avfoundation -list_devices true -i "")
+   ffmpeg -f avfoundation -framerate 60 -capture_cursor 1 -i "1:BlackHole 2ch" \
+     -map 0:v -vf scale=1920:1080 -c:v h264_videotoolbox -realtime 1 \
+     -b:v 8M -maxrate 12M -bf 0 -g 30 -f h264 pipe:1 \
+     -map 0:a -c:a libopus -b:a 128k -application lowdelay \
+     -f rtp -sdp_file audio.sdp rtp://127.0.0.1:5004 \
+   | gamecast stream -server ws://SIGNAL_HOST:8080/ws -room friday -audio-in 127.0.0.1:5004
    ```
+
+   `-sdp_file` matters: without it, ffmpeg prints the RTP session description to
+   stdout, into the video pipe. To stream without audio, use `-i "1:none"`, drop
+   the `-map` options and the audio output, and leave out `-audio-in`.
 
 3. **Viewers on fast, wired connections** volunteer as supernode:
 
@@ -426,6 +482,8 @@ picture should continue through the backup, and the server log shows
    gamecast watch -server ws://SIGNAL_HOST:8080/ws -room friday -out - \
    | ffplay -fflags nobuffer -flags low_delay -framedrop -f h264 -
    ```
+
+   For audio, add `-audio-out audio.ogg` and play it as shown in the local demo.
 
 If peers can't connect directly (strict NAT or firewalls), add a TURN server
 with `-ice`. See [Networking and deployment](#networking-and-deployment).
@@ -469,8 +527,11 @@ apply to that command.
 | `-loop` | `false` | stream | Replay the `-in` file forever (for testing without an encoder). |
 | `-fps` | `60` | stream | Frame rate. Used to pace files and as the nominal frame duration. |
 | `-bitrate` | `8000` | stream | Encoder target in kbps. Only used to size the supernode; it doesn't change the encoder. Keep it in line with ffmpeg's `-b:v`. |
+| `-audio-in` | none | stream | Receive game audio as Opus RTP on this UDP address, e.g. `127.0.0.1:5004`. Port+1 is also bound to absorb the encoder's RTCP. Empty = no audio. |
+| `-audio-bitrate` | `128` | stream | Opus bitrate in kbps, added to `-bitrate` when sizing the supernode. Keep it in line with ffmpeg's `-b:a`. |
 | `-host` | `false` | watch | Volunteer this PC as supernode/backup. |
 | `-out` | `-` | watch | Where to write received H.264: `-` for stdout, a file path, or `""` to discard. |
+| `-audio-out` | none | watch | Where to write received game audio as Ogg/Opus: a file, a named pipe, or `-` for stdout (only if `-out` isn't `-`). Empty = don't write audio. |
 
 Input pacing: from stdin, frames are sent as they arrive (the encoder sets the
 pace). From a file, frames are paced at `-fps`.
@@ -511,6 +572,31 @@ ffmpeg -f lavfi -i ddagrab=framerate=60 -c:v h264_qsv -preset veryfast \
 ```
 
 Pipe any of these into `gamecast stream -server … -room …`.
+
+### Game audio
+
+| Setting | Value | Why |
+|---|---|---|
+| Codec | `-c:a libopus` | The only audio codec gamecast negotiates |
+| Bitrate | `-b:a 128k` | Good quality for game audio; match `-audio-bitrate` |
+| Mode | `-application lowdelay` | Lowest-latency Opus mode |
+| Output | `-f rtp -sdp_file audio.sdp rtp://127.0.0.1:5004` | RTP to gamecast's `-audio-in`; `-sdp_file` keeps the SDP out of stdout |
+
+Add the audio output to the same ffmpeg command as the video, with `-map` to
+pick streams. Windows example with an audio capture device:
+
+```sh
+ffmpeg -f lavfi -i ddagrab=framerate=60 -f dshow -i audio="Stereo Mix (Realtek(R) Audio)" \
+  -map 0:v -c:v h264_nvenc -preset p1 -tune ull -rc cbr -b:v 8M -maxrate 12M -bufsize 8M \
+  -bf 0 -g 30 -f h264 pipe:1 \
+  -map 1:a -c:a libopus -b:a 128k -application lowdelay \
+  -f rtp -sdp_file audio.sdp rtp://127.0.0.1:5004 \
+| gamecast stream -server … -room … -audio-in 127.0.0.1:5004
+```
+
+Why RTP over local UDP for audio input? The video already uses stdin, and UDP
+works the same on Windows, macOS and Linux with no named pipes and no container
+buffering. Each Opus packet arrives as soon as it's encoded.
 
 Parsing a pipe adds about one frame (~16 ms) of delay, because a NAL unit's end
 is only known when the next start code arrives. The native encoder integration
@@ -697,12 +783,16 @@ GOOS=windows go vet ./...                # check the Windows build
 | `TestFailoverWhenSupernodeHangs` | A frozen supernode (sockets open, nothing sent) is replaced within 1.5 s (measured ~570 ms); the new supernode's own player also recovers |
 | `TestFailoverWhenSupernodeLeaves` | A clean leave recovers within 500 ms (measured ~20 ms) |
 | `TestStreamerPauseDoesNotTriggerFailover` | A 3 s streamer stall doesn't change the host; the stream resumes through the same host |
+| `TestRTPAudioSourceReceivesOpusAndSkipsJunk` | The UDP audio input accepts Opus RTP and ignores non-RTP and RTCP datagrams |
+| `TestAudioSinkWritesOggOpus` | Viewer audio output is a valid Ogg/Opus stream containing every packet |
+| Audio in the integration tests | Every viewer receives game audio through the supernode; after a supernode hang, audio resumes through the backup |
 | `TestSampleSeesCPUAndMemory` | `-stats` reports CPU under load, drops when idle, and reports memory |
 
 The integration tests run a real signaling server and real WebRTC peers in one
-process over loopback, with a synthetic H.264 source: valid NAL framing with
+process over loopback, with a synthetic H.264 source and a synthetic Opus source (valid TOC byte,
+20 ms packets). The H.264 source has valid NAL framing with
 SPS/PPS/IDR and P-frames, and keyframes larger than the MTU so fragmentation is
-exercised. They check the bytes that reach each viewer's output.
+exercised. They check the bytes that reach each viewer's video and audio outputs.
 
 ---
 
@@ -720,6 +810,8 @@ gamecast/
     ├── peer/
     │   ├── client.go               Signaling loop, status heartbeat, topology → desired links, frame pump
     │   ├── links.go                Persistent links: offer/answer, live/standby swap, forwarding, PLI
+    │   ├── audio.go                Opus codec, UDP RTP audio input, Ogg/Opus audio output
+    │   ├── audio_test.go
     │   ├── media.go                WebRTC API setup (codec, interceptors, ICE), keyframe throttle
     │   ├── source.go               Annex-B H.264 → frames; FrameSource interface
     │   ├── speedtest.go            Upload measurement against the signaling server
@@ -731,6 +823,8 @@ gamecast/
 
 - `peer.FrameSource` (`NextFrame`, `RequestKeyframe`): plug in a native
   capture + hardware encoder here.
+- `peer.AudioSource` (`NextPacket`): plug in native system-audio capture + an
+  Opus encoder here.
 - `Client.OnTopology(func(proto.Topology))`: hook for a UI that shows who is
   hosting, backing up and degraded.
 
@@ -779,7 +873,13 @@ applies when links are first set up, never during failover.
 
 - **Video comes from an ffmpeg pipe.** Keyframes can't be requested on demand, and
   parsing the pipe adds about one frame of delay.
-- **No audio** (neither game audio nor voice chat).
+- **No voice chat.** Only game audio, one way, from the streamer.
+- **Audio and video are separate outputs.** With two ffplay windows there is no
+  lip sync. The planned in-app player will sync them.
+- **System audio capture through ffmpeg needs a loopback device** (see
+  [Requirements](#requirements)).
+- **Audio has a gap during failover** equal to the failover time (~0.5–0.8 s).
+  Lost audio isn't recovered.
 - **Playback uses ffplay**; there is no in-app player and no UI.
 - **Fixed bitrate.** A viewer on a weak connection stutters instead of getting
   lower quality. There is no bitrate adaptation or SVC yet.
@@ -810,14 +910,13 @@ This is a prototype. **Don't expose it to untrusted users yet.**
 
 | Priority | Item | Notes |
 |---|---|---|
-| 1 | **Game audio** | An Opus track on the same links; the supernode forwards it unchanged and failover covers it automatically |
-| 2 | **Real-world testing** | Real video via ffmpeg, peers on different networks, TURN, Windows |
-| 3 | **Native capture + GPU encoding** | Windows.Graphics.Capture / ScreenCaptureKit with NVENC / AMF / QSV / VideoToolbox behind `FrameSource`: keyframes on request, no ffmpeg |
-| 4 | **Voice chat** | Peer-to-peer mesh (~0.3 Mbps per person); needs echo cancellation (OS voice-processing modes or the WebRTC audio processing module) |
-| 5 | **In-app player and desktop UI** | Hardware decode, vsync-paced rendering; UI built on `OnTopology` |
-| 6 | **Bitrate adaptation** | From congestion feedback (TWCC/REMB); temporal SVC so weak viewers get 30 fps |
-| 7 | **Security** | Room tokens, `wss://`, SFrame end-to-end encryption |
-| 8 | **Efficiency** | Pooled packet buffers (removes ~6,000 allocations/s on the supernode), trickle ICE, peer-to-peer upload probe |
+| 1 | **Real-world testing** | Real video and audio via ffmpeg, peers on different networks, TURN, Windows |
+| 2 | **Native capture + GPU encoding** | Windows.Graphics.Capture / ScreenCaptureKit with NVENC / AMF / QSV / VideoToolbox behind `FrameSource`, plus WASAPI loopback / ScreenCaptureKit audio behind `AudioSource`: keyframes on request, no ffmpeg, no loopback device |
+| 3 | **Voice chat** | Peer-to-peer mesh (~0.3 Mbps per person); needs echo cancellation (OS voice-processing modes or the WebRTC audio processing module) |
+| 4 | **In-app player and desktop UI** | Hardware decode, vsync-paced rendering, audio/video sync; UI built on `OnTopology` |
+| 5 | **Bitrate adaptation** | From congestion feedback (TWCC/REMB); temporal SVC so weak viewers get 30 fps |
+| 6 | **Security** | Room tokens, `wss://`, SFrame end-to-end encryption |
+| 7 | **Efficiency** | Pooled packet buffers (removes ~6,000 allocations/s on the supernode), trickle ICE, peer-to-peer upload probe |
 
 ---
 
@@ -834,6 +933,10 @@ This is a prototype. **Don't expose it to untrusted users yet.**
 | `upload test failed … reporting 0 Mbps` | The `/speedtest` endpoint couldn't be reached. Pass `-upload` manually. |
 | Upload measured far too high | The signaling server is on the same LAN or machine. Pass `-upload` with your real ISP upload. |
 | The host keeps changing | Its connection is unstable (Wi-Fi jitter). Prefer a wired `-host` viewer. A failed host is excluded for 30 s. |
+| Video garbled from the start when audio is enabled | ffmpeg is printing the RTP SDP into the video pipe. Add `-sdp_file audio.sdp` to the audio output. |
+| No audio on viewers | Check the streamer logged `game audio: listening for Opus RTP on …` and that ffmpeg sends to that exact address. The viewer needs `-audio-out`. |
+| `audio input …: address already in use` | Another process uses the port (or port+1 is taken, which is only a warning). Pick another `-audio-in` port and match it in ffmpeg. |
+| A viewer hangs at startup with `-audio-out` on a named pipe | Opening a named pipe waits for a reader. Start ffplay on the pipe first. |
 | Stream stutters for everyone | The supernode's upload is saturated. Check `-stats` and the router; enable SQM/QoS. |
 
 ## FAQ
@@ -841,6 +944,10 @@ This is a prototype. **Don't expose it to untrusted users yet.**
 **How many viewers can it handle?** It's designed for about 10. The limit is the
 supernode's upload: each viewer adds about 10 Mbps. Beyond about 10 viewers, use
 a real SFU.
+
+**Is there voice chat?** Not yet. Game audio goes one way from the streamer.
+Voice chat is planned as a separate peer-to-peer mesh; it needs echo
+cancellation, which the WebRTC library used here doesn't provide.
 
 **Can viewers watch in a browser?** Not yet. The protocol is plain WebRTC, so a
 browser viewer is possible, but it would need a small web client and matching
