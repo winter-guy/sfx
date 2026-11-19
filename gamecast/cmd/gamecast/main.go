@@ -102,10 +102,13 @@ func runPeer(ctx context.Context, role string, args []string) error {
 	loop := fs.Bool("loop", false, "stream: replay -in file forever")
 	fps := fs.Int("fps", 60, "stream: frame rate")
 	bitrate := fs.Int("bitrate", signaling.DefaultBitrateKbps, "stream: encoder target kbps (used to size the supernode)")
+	audioIn := fs.String("audio-in", "", "stream: receive game audio as Opus RTP on this UDP address, e.g. 127.0.0.1:5004 ('' = no audio)")
+	audioKbps := fs.Int("audio-bitrate", 128, "stream: Opus bitrate in kbps (added to -bitrate when sizing the supernode)")
 
 	// watch
 	canHost := fs.Bool("host", false, "watch: volunteer this PC as supernode")
 	out := fs.String("out", "-", "watch: write received H.264 here ('-' = stdout, '' = discard)")
+	audioOut := fs.String("audio-out", "", "watch: write received game audio as Ogg/Opus here (file or named pipe; '-' = stdout if -out isn't; '' = none)")
 	_ = fs.Parse(args)
 	go procstats.Log(ctx, *stats, log.Printf)
 
@@ -128,6 +131,34 @@ func runPeer(ctx context.Context, role string, args []string) error {
 		ICEServers:      parseICE(*ice),
 		IncludeLoopback: *loopback,
 		FPS:             *fps,
+	}
+
+	if role == proto.RoleStreamer && *audioIn != "" {
+		src, err := peer.ListenRTPAudio(*audioIn)
+		if err != nil {
+			return err
+		}
+		defer src.Close()
+		go func() { <-ctx.Done(); src.Close() }()
+		cfg.Audio = src
+		cfg.BitrateKbps += *audioKbps
+		log.Printf("game audio: listening for Opus RTP on %s", src.Addr())
+	}
+	if role == proto.RoleViewer && *audioOut != "" {
+		switch *audioOut {
+		case "-":
+			if *out == "-" {
+				return fmt.Errorf("-audio-out - and -out - can't both use stdout")
+			}
+			cfg.AudioOutput = os.Stdout
+		default:
+			f, err := os.Create(*audioOut)
+			if err != nil {
+				return err
+			}
+			defer f.Close()
+			cfg.AudioOutput = f
+		}
 	}
 
 	if role == proto.RoleStreamer {
