@@ -38,6 +38,8 @@ const USAGE: &str = "usage: voice --send HOST:PORT [options]
                      reference: echo-cancel game audio that the OS already plays
   --bitrate BPS      Opus bitrate for the mic               (default: 32000)
   --muted            start muted
+  --mic-delay MS     hold the mic back before echo cancellation (default: 80 with
+                     --game reference, else 0); see engine::default_mic_delay_ms
   --no-aec --no-ns --no-agc   disable echo cancellation / noise suppression / AGC
   --echo-sim G:MS    test aid: leak G x speaker output into the mic MS ms later";
 
@@ -64,8 +66,10 @@ fn run() -> Result<()> {
         bitrate: 32_000,
         ssrc: engine::rand_u32(),
         echo_sim: None,
+        mic_delay_ms: 0,
     };
     let mut muted = false;
+    let mut mic_delay = None;
     while let Some(a) = args.next() {
         let mut val = || args.next().with_context(|| format!("{a} needs a value"));
         match a.as_str() {
@@ -83,6 +87,7 @@ fn run() -> Result<()> {
             }
             "--bitrate" => cfg.bitrate = val()?.parse().context("--bitrate")?,
             "--muted" => muted = true,
+            "--mic-delay" => mic_delay = Some(val()?.parse().context("--mic-delay")?),
             "--no-aec" => cfg.aec = false,
             "--no-ns" => cfg.noise_suppression = false,
             "--no-agc" => cfg.agc = false,
@@ -99,6 +104,7 @@ fn run() -> Result<()> {
         }
     }
     let send = send.context(format!("--send is required\n{USAGE}"))?;
+    cfg.mic_delay_ms = mic_delay.unwrap_or_else(|| engine::default_mic_delay_ms(cfg.game_mode));
 
     let voice_sock = UdpSocket::bind("127.0.0.1:0")?;
     let game_sock = UdpSocket::bind("127.0.0.1:0")?;
@@ -114,8 +120,8 @@ fn run() -> Result<()> {
     let mut engine = Engine::new(cfg.clone())?;
     engine.set_muted(muted);
     eprintln!(
-        "voice: ready (aec={} ns={} agc={} game={:?} muted={muted})",
-        cfg.aec, cfg.noise_suppression, cfg.agc, cfg.game_mode
+        "voice: ready (aec={} ns={} agc={} game={:?} mic_delay={}ms muted={muted})",
+        cfg.aec, cfg.noise_suppression, cfg.agc, cfg.game_mode, cfg.mic_delay_ms
     );
 
     // Handshake: tell the parent where to send packets.

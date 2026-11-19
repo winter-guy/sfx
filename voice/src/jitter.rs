@@ -7,7 +7,7 @@ use std::time::Instant;
 use crate::opus::Decoder;
 
 /// Packets buffered before playback (re)starts: absorbs network jitter.
-const START_PACKETS: usize = 2;
+pub const START_PACKETS: usize = 2;
 /// Above this, drop the oldest packets so latency can't grow without bound
 /// (e.g. clock drift or a burst after a stall). 10 × 20 ms = 200 ms.
 const MAX_PACKETS: usize = 10;
@@ -15,6 +15,9 @@ const MAX_PACKETS: usize = 10;
 const MAX_CONCEAL: u64 = 5;
 /// Largest Opus packet: 120 ms at 48 kHz.
 const MAX_FRAME: usize = 5760;
+/// A packet this far *behind* the playout position isn't late, it's a new
+/// stream (the sender restarted with a fresh random sequence number).
+const RESET_GAP: u64 = 100;
 
 pub struct JitterBuffer {
     dec: Decoder,
@@ -24,6 +27,7 @@ pub struct JitterBuffer {
     next: Option<u64>,
     pcm: VecDeque<f32>,
     playing: bool,
+    start_packets: usize,
     last_frame: usize, // samples per channel of the last decoded packet
     decode_buf: Vec<f32>,
     pub last_rx: Instant,
@@ -37,10 +41,17 @@ pub struct Stats {
     pub concealed: u64,
     pub dropped: u64,
     pub bad: u64,
+    pub resets: u64,
 }
 
 impl JitterBuffer {
     pub fn new(dec: Decoder) -> Self {
+        Self::with_start(dec, START_PACKETS)
+    }
+
+    /// Like `new`, but starts playing once `start_packets` are buffered.
+    /// 1 means "as soon as anything arrives" (lowest latency, no jitter margin).
+    pub fn with_start(dec: Decoder, start_packets: usize) -> Self {
         let ch = dec.channels();
         JitterBuffer {
             dec,
@@ -50,6 +61,7 @@ impl JitterBuffer {
             next: None,
             pcm: VecDeque::new(),
             playing: false,
+            start_packets: start_packets.max(1),
             last_frame: 960,
             decode_buf: vec![0.0; MAX_FRAME * ch],
             last_rx: Instant::now(),
@@ -73,10 +85,18 @@ impl JitterBuffer {
     pub fn push(&mut self, seq: u16, payload: &[u8]) {
         self.last_rx = Instant::now();
         self.stats.received += 1;
-        let ext = self.unwrap_seq(seq);
-        if self.next.is_some_and(|n| ext < n) {
-            self.stats.late += 1;
-            return;
+        let mut ext = self.unwrap_seq(seq);
+        if let Some(n) = self.next
+            && ext < n
+        {
+            if n - ext <= RESET_GAP {
+                self.stats.late += 1;
+                return;
+            }
+            // Far behind: the sender restarted. Start over on the new stream.
+            self.reset();
+            self.stats.resets += 1;
+            ext = self.unwrap_seq(seq);
         }
         self.highest = Some(self.highest.map_or(ext, |h| h.max(ext)));
         self.packets.insert(ext, payload.to_vec());
@@ -85,6 +105,14 @@ impl JitterBuffer {
             self.stats.dropped += 1;
             self.next = self.packets.keys().next().copied();
         }
+    }
+
+    fn reset(&mut self) {
+        self.packets.clear();
+        self.pcm.clear();
+        self.highest = None;
+        self.next = None;
+        self.playing = false;
     }
 
     fn decode_into_pcm(&mut self, packet: Option<Vec<u8>>) {
@@ -108,7 +136,7 @@ impl JitterBuffer {
     /// writes silence while buffering or when the stream has run dry.
     pub fn pull(&mut self, out: &mut [f32]) -> bool {
         if !self.playing {
-            if self.packets.len() < START_PACKETS {
+            if self.packets.len() < self.start_packets {
                 out.fill(0.0);
                 return false;
             }
@@ -212,5 +240,32 @@ mod tests {
         }
         assert_eq!(j.packets.len(), MAX_PACKETS);
         assert_eq!(j.stats.dropped, 5);
+    }
+
+    #[test]
+    fn restarts_after_backward_sequence_jump() {
+        let p = packets(8);
+        let mut j = jb();
+        let mut out = [0.0f32; 480];
+        for (i, s) in (40_000u16..40_004).enumerate() {
+            j.push(s, &p[i]);
+        }
+        while j.pull(&mut out) {}
+        // Sender restarts at a random, lower sequence number (20000 behind;
+        // under half the 16-bit space, so it really is "behind", not a wrap).
+        j.push(20_000, &p[4]);
+        j.push(20_001, &p[5]);
+        assert_eq!(j.stats.resets, 1);
+        assert_eq!(j.stats.late, 0, "a restart isn't a late packet");
+        assert!(j.pull(&mut out), "plays the new stream right away");
+    }
+
+    #[test]
+    fn start_threshold_one_plays_immediately() {
+        let p = packets(1);
+        let mut j = JitterBuffer::with_start(Decoder::new(1).unwrap(), 1);
+        let mut out = [0.0f32; 480];
+        j.push(7, &p[0]);
+        assert!(j.pull(&mut out));
     }
 }
