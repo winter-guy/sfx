@@ -166,10 +166,17 @@ func logger(t *testing.T, name string) func(string, ...any) {
 }
 
 func (r *room) start(name string, cfg Config) *testPeer {
+	return r.startWithLog(name, cfg, nil)
+}
+
+func (r *room) startWithLog(name string, cfg Config, capture *logCapture) *testPeer {
 	t := r.t
 	cfg.ServerURL, cfg.Room, cfg.Name = r.wsURL, "test", name
 	cfg.IncludeLoopback = true
 	cfg.Logf = logger(t, name)
+	if capture != nil {
+		cfg.Logf = capture.wrap(cfg.Logf)
+	}
 	tp := &testPeer{name: name}
 	if cfg.Role == proto.RoleViewer {
 		tp.out, tp.audio = &syncBuffer{}, &syncBuffer{}

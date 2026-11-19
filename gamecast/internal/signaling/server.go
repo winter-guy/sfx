@@ -165,8 +165,8 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		_ = conn.WriteJSON(proto.Message{Type: proto.TypeError, Error: err.Error()})
 		return
 	}
-	s.Logf("[%s] %s joined as %s (%q, up=%.0f Mbps, wired=%v, canHost=%v)",
-		j.Room, p.id, j.Role, j.Name, j.UploadMbps, j.Wired, j.CanHost)
+	s.Logf("[%s] %s joined as %s (%q, up=%.0f Mbps, wired=%v, canHost=%v, voice=%v)",
+		j.Room, p.id, j.Role, j.Name, j.UploadMbps, j.Wired, j.CanHost, j.Voice)
 
 	if err := p.send(proto.Message{Type: proto.TypeWelcome, ID: p.id}); err != nil {
 		s.removePeer(rm, p)
@@ -346,7 +346,7 @@ func (s *Server) reconcile(r *room) {
 	s.mu.Lock()
 	var streamer *Candidate
 	var viewerCands []*Candidate
-	var viewerIDs []string
+	var viewerIDs, voiceIDs []string
 	names := map[string]string{}
 	bitrate := DefaultBitrateKbps
 
@@ -358,6 +358,9 @@ func (s *Server) reconcile(r *room) {
 
 	for _, p := range all {
 		names[p.id] = p.join.Name
+		if p.join.Voice {
+			voiceIDs = append(voiceIDs, p.id)
+		}
 		c := &Candidate{ID: p.id, UploadMbps: p.join.UploadMbps, Wired: p.join.Wired, CanHost: p.join.CanHost, JoinSeq: p.seq}
 		if p.id == r.streamer {
 			c.IsStreamer, c.CanHost = true, true
@@ -392,6 +395,7 @@ func (s *Server) reconcile(r *room) {
 		Host:        d.Host,
 		Backup:      d.Backup,
 		Viewers:     viewerIDs,
+		Voice:       voiceIDs,
 		Names:       names,
 		BitrateKbps: bitrate,
 		Degraded:    d.Degraded,

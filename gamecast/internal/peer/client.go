@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -55,6 +56,9 @@ type Config struct {
 	// Viewer: received game audio as an Ogg/Opus stream (optional).
 	AudioOutput io.Writer
 
+	// Voice chat (optional, any role): runs the gamecast-voice sidecar.
+	Voice *VoiceConfig
+
 	Logf func(format string, args ...any)
 }
 
@@ -100,6 +104,13 @@ type Client struct {
 	out      *outputSink
 	audioOut *audioSink
 
+	// Voice chat: mesh links (guarded by mu) and the sidecar.
+	voice        atomic.Pointer[voiceEngine]
+	voiceTrack   *webrtc.TrackLocalStaticRTP
+	vlinks       map[string]*link
+	wantVoice    map[string]bool
+	voicePending map[string]proto.Message
+
 	hung atomic.Bool // test hook: behave like a frozen process
 }
 
@@ -123,6 +134,13 @@ func New(cfg Config) (*Client, error) {
 		wantSend: map[string]bool{},
 		wantRecv: map[string]bool{},
 		pending:  map[string]proto.Message{},
+
+		vlinks:       map[string]*link{},
+		wantVoice:    map[string]bool{},
+		voicePending: map[string]proto.Message{},
+	}
+	if c.voiceTrack, err = webrtc.NewTrackLocalStaticRTP(OpusCapability, "voice", "gamecast-voice"); err != nil {
+		return nil, err
 	}
 	c.playFrom.Store("")
 	c.fwdFrom.Store("")
@@ -199,10 +217,26 @@ func (c *Client) Run(ctx context.Context) error {
 		conn.Close()
 	}()
 
+	if c.cfg.Voice != nil {
+		// The streamer hears the game through the OS already: its sidecar
+		// only uses game audio as echo reference.
+		gameMode := "play"
+		if c.cfg.Role == proto.RoleStreamer {
+			gameMode = "reference"
+		}
+		v, err := startVoice(*c.cfg.Voice, gameMode, c.cfg.Logf)
+		if err != nil {
+			return err
+		}
+		c.voice.Store(v)
+		defer v.close()
+		go c.pumpMic(v)
+	}
+
 	join := proto.Join{
 		Room: c.cfg.Room, Role: c.cfg.Role, Name: c.cfg.Name,
 		UploadMbps: c.cfg.UploadMbps, Wired: c.cfg.Wired, CanHost: c.cfg.CanHost,
-		BitrateKbps: c.cfg.BitrateKbps,
+		BitrateKbps: c.cfg.BitrateKbps, Voice: c.cfg.Voice != nil,
 	}
 	if err := c.send(proto.Message{Type: proto.TypeJoin, Join: &join}); err != nil {
 		return err
@@ -298,6 +332,11 @@ func (c *Client) pumpAudio(ctx context.Context) {
 			return
 		}
 		_ = c.audio.WriteRTP(p)
+		if v := c.voice.Load(); v != nil {
+			if b, err := p.Marshal(); err == nil {
+				v.sendGame(b) // echo reference for the streamer's own mic
+			}
+		}
 	}
 }
 
@@ -363,6 +402,7 @@ func (c *Client) applyTopology(t proto.Topology) {
 			t.Version, c.roleLocked(t), t.Host, t.Backup, t.Degraded, t.Reason)
 	}
 	c.reconcileLocked(t, prev)
+	c.reconcileVoiceLocked(t)
 	cbs := append([]func(proto.Topology){}, c.onChange...)
 	c.mu.Unlock()
 	for _, f := range cbs {
@@ -482,6 +522,10 @@ func (c *Client) reconcileLocked(t proto.Topology, prev *proto.Topology) {
 func (c *Client) handleSignal(m proto.Message) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if strings.HasPrefix(m.Link, "voice/") {
+		c.handleVoiceSignalLocked(m)
+		return
+	}
 	switch m.Signal.Kind {
 	case "offer":
 		if !c.wantRecv[m.From] {
@@ -509,6 +553,10 @@ func (c *Client) closeAll() {
 	for key, l := range c.links {
 		l.close()
 		delete(c.links, key)
+	}
+	for p, l := range c.vlinks {
+		l.close()
+		delete(c.vlinks, p)
 	}
 }
 

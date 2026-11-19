@@ -3,7 +3,8 @@
 **Low-latency game streaming to a small group, with no media server.**
 
 gamecast streams a game from one PC to a small group of friends (about 10 people)
-as H.264 1080p60 with Opus game audio over WebRTC. A streamer's home connection usually can't send 9 copies of a 1080p60
+as H.264 1080p60 with Opus game audio over WebRTC, with voice chat between
+everyone in the room. A streamer's home connection usually can't send 9 copies of a 1080p60
 stream, so gamecast elects a **supernode**: one viewer on a fast connection
 receives the stream once and forwards it to everyone else. Any client can be
 elected, because every client runs the same forwarding code. A **warm backup** takes over in
@@ -13,9 +14,10 @@ The only server is a lightweight **signaling server** that coordinates peers.
 It never touches video.
 
 > **Status: working prototype.** The media core (election, forwarding, failover)
-> and game audio are implemented and covered by automated tests. Capture and
-> playback currently rely on `ffmpeg`/`ffplay`, there is no voice chat yet, and it
-> has not yet been tested between machines on different networks. See [Project status](#project-status).
+> game audio and voice chat are implemented and covered by automated tests.
+> Video capture and playback currently rely on `ffmpeg`/`ffplay`, voice has only
+> been tested with synthetic audio (not real microphones and speakers), and
+> nothing has been tested between machines on different networks. See [Project status](#project-status).
 
 ---
 
@@ -31,6 +33,7 @@ It never touches video.
   - [Supernode election](#supernode-election)
   - [Failure detection and failover](#failure-detection-and-failover)
   - [Keyframes](#keyframes)
+  - [Voice chat](#voice-chat)
 - [Requirements](#requirements)
 - [Getting started](#getting-started)
 - [Command reference](#command-reference)
@@ -62,6 +65,11 @@ It never touches video.
   untouched: no decode, no quality loss, little CPU.
 - **Game audio.** An Opus track travels the same links as the video, is
   forwarded the same way and switches with it on failover.
+- **Voice chat with echo cancellation.** A peer-to-peer voice mesh, separate
+  from the video tree, so supernode failovers never cut voice. The audio work
+  (mic, echo cancellation, noise suppression, gain control, Opus, mixing) runs
+  in a small Rust sidecar built on [sonora](https://crates.io/crates/sonora),
+  a pure-Rust port of WebRTC's audio processing.
 - **Automatic supernode election** based on upload bandwidth, wired vs Wi-Fi
   and opt-in, with a degraded mode when nobody qualifies.
 - **Sub-second failover.** A warm standby backup is pre-connected; switching is a
@@ -88,7 +96,8 @@ It never touches video.
 | Real video (ffmpeg capture → ffplay) | ⚠️ Untested | ffmpeg was not available on the development machine; tests use synthetic H.264 |
 | Peers on different networks (NAT, TURN) | ⚠️ Untested | Only tested over loopback |
 | Windows | ⚠️ Compiles only | Passes `go vet` for Windows, never run there |
-| Voice chat, native capture/encoding, in-app player, UI | ❌ Not started | See [Roadmap](#roadmap) |
+| Voice chat (Rust sidecar, sonora echo cancellation) | ✅ Done | Rust unit tests (76 dB echo reduction in simulation); Go end-to-end tests with the real sidecar (64 dB echo reduction, mute, game audio); CLI smoke test. **Real microphones and speakers untested** |
+| Native capture/encoding, in-app player, UI | ❌ Not started | See [Roadmap](#roadmap) |
 
 ---
 
@@ -297,14 +306,58 @@ viewer ──PLI──▶ supernode ──PLI──▶ streamer ──▶ encode
   keep the keyframe interval short (`-g 30`, 0.5 s). The planned native encoder
   will honor requests immediately.
 
+### Voice chat
+
+Voice is split between two processes. **gamecast (Go)** carries the packets;
+the **gamecast-voice sidecar (Rust)** does all the audio work:
+
+```
+            gamecast (Go)                          gamecast-voice (Rust sidecar)
+  ┌───────────────────────────────┐   UDP   ┌──────────────────────────────────────┐
+  │ voice mesh: 1 PeerConnection  │ ◀────── │ mic ─▶ sonora: echo cancel, noise   │
+  │ per pair of voice peers,      │  Opus   │        suppression, AGC ─▶ Opus 32k │
+  │ Opus RTP both ways            │   RTP   │                                      │
+  │                               │ ──────▶ │ voices ─▶ jitter buffer (per SSRC) ─┐│
+  │ game audio (from video tree)  │ ──────▶ │ game   ─▶ jitter buffer ────────────┤│
+  └───────────────────────────────┘         │            mix ─▶ speakers  ◀───────┘│
+                                            │              └──▶ echo reference      │
+                                            └──────────────────────────────────────┘
+```
+
+- **Mesh, not the supernode tree.** Every voice peer has one sendrecv audio
+  PeerConnection to every other voice peer (the smaller peer ID offers). Voice
+  is about 32 kbps per stream, so even 10 people need only ~0.3 Mbps up each.
+  Because it doesn't depend on the supernode, a video failover never interrupts
+  voice.
+- **Encode once.** Each peer's mic is encoded once by the sidecar and the same
+  packets go out on every voice link.
+- **Echo cancellation sees everything you hear.** The sidecar plays voices *and*
+  game audio, so both are in the echo canceller's reference signal and your mic
+  doesn't send them back. On the **streamer**, the game is already playing
+  through the OS, so the sidecar gets game audio as *reference only*
+  (`--game reference`), not to play.
+- **Jitter buffer** per speaker: reorders packets, conceals short gaps with
+  Opus packet loss concealment, skips long gaps, and caps buffering at 200 ms.
+- **Devices:** the default microphone and speakers via cpal (CoreAudio, WASAPI,
+  ALSA), resampled to 48 kHz as needed.
+- **Process protocol:** the sidecar prints one handshake line on stdout
+  (`READY voice=127.0.0.1:P game=127.0.0.1:Q`), takes `mute`, `unmute` and `quit`
+  on stdin, quits when stdin closes (so it never outlives gamecast), and logs to
+  stderr, which gamecast forwards to its own log.
+- **Mute** from Go: `Client.SetVoiceMuted(bool)`; from the CLI: `-voice-muted`
+  at startup.
+
 ---
 
 ## Requirements
 
 ### To build
 
-- Go **1.24** or newer
-- No cgo, no C libraries
+- Go **1.24** or newer. No cgo, no C libraries.
+- **For voice chat only:** Rust (via [rustup](https://rustup.rs)) and libopus
+  (`brew install opus`, `apt install libopus-dev`), found with pkg-config. Or
+  build with `--features bundled`, which compiles libopus from source and links
+  it statically (needs cmake); that's the better choice for release builds.
 
 ### To run (for now)
 
@@ -378,7 +431,12 @@ last decade), with at least 10 Mbps download.
 ```sh
 cd gamecast
 go build -o bin/gamecast ./cmd/gamecast
-go test -race ./...
+
+# Voice chat sidecar (optional). gamecast looks for it next to its own binary.
+(cd voice && cargo build --release) && cp voice/target/release/gamecast-voice bin/
+
+go test -race ./...                 # voice tests are skipped if the sidecar isn't built
+(cd voice && cargo test)
 ```
 
 ### Try it on one machine
@@ -437,6 +495,21 @@ ffplay -nodisp -fflags nobuffer audio.ogg &
 On Windows, write audio to a file (`-audio-out game.ogg`), or send audio to
 stdout (`-audio-out -`) and video to a file.
 
+**Voice chat without a microphone:** two viewers talk using synthetic audio.
+Bob's playback is recorded to a raw file, so no devices or permissions are needed:
+
+```sh
+./bin/gamecast watch -server ws://127.0.0.1:8080/ws -room demo -loopback -ice= \
+  -out "" -voice -voice-input sine:440 -voice-output null &
+./bin/gamecast watch -server ws://127.0.0.1:8080/ws -room demo -loopback -ice= \
+  -out "" -voice -voice-input silence -voice-output raw:bob.raw
+
+ffplay -f f32le -ar 48000 -ch_layout stereo bob.raw   # Bob heard a 440 Hz tone
+```
+
+With real devices, just add `-voice`. The default microphone and speakers are
+used (macOS asks for microphone permission the first time).
+
 To see failover, freeze the supernode with `kill -STOP <pid>`. The plain viewer's
 picture should continue through the backup, and the server log shows
 `host … declared failed`.
@@ -469,6 +542,9 @@ picture should continue through the backup, and the server log shows
    stdout, into the video pipe. To stream without audio, use `-i "1:none"`, drop
    the `-map` options and the audio output, and leave out `-audio-in`.
 
+   Add `-voice` to join voice chat. For the streamer this also echo-cancels the
+   game sound picked up by the mic.
+
 3. **Viewers on fast, wired connections** volunteer as supernode:
 
    ```sh
@@ -483,7 +559,9 @@ picture should continue through the backup, and the server log shows
    | ffplay -fflags nobuffer -flags low_delay -framedrop -f h264 -
    ```
 
-   For audio, add `-audio-out audio.ogg` and play it as shown in the local demo.
+   For game audio, either add `-voice` (the voice sidecar plays game audio
+   through your speakers, with echo cancellation) or add `-audio-out audio.ogg`
+   and play it as shown in the local demo.
 
 If peers can't connect directly (strict NAT or firewalls), add a TURN server
 with `-ice`. See [Networking and deployment](#networking-and-deployment).
@@ -531,7 +609,32 @@ apply to that command.
 | `-audio-bitrate` | `128` | stream | Opus bitrate in kbps, added to `-bitrate` when sizing the supernode. Keep it in line with ffmpeg's `-b:a`. |
 | `-host` | `false` | watch | Volunteer this PC as supernode/backup. |
 | `-out` | `-` | watch | Where to write received H.264: `-` for stdout, a file path, or `""` to discard. |
+| `-voice` | `false` | both | Join voice chat. Starts the gamecast-voice sidecar; on viewers it also plays game audio. |
+| `-voice-bin` | auto | both | Path to `gamecast-voice`. Default: next to the gamecast binary, then `$PATH`. |
+| `-voice-input` | `default` | both | Microphone: `default`, `sine:FREQ` (test tone) or `silence`. |
+| `-voice-output` | `default` | both | Playback: `default` (speakers), `raw:PATH` (f32le 48 kHz stereo file) or `null`. |
+| `-voice-muted` | `false` | both | Start with the microphone muted. |
 | `-audio-out` | none | watch | Where to write received game audio as Ogg/Opus: a file, a named pipe, or `-` for stdout (only if `-out` isn't `-`). Empty = don't write audio. |
+
+### `gamecast-voice` (sidecar)
+
+Normally started by gamecast, but it can be run alone for diagnosis:
+
+```
+gamecast-voice --send HOST:PORT [options]
+gamecast-voice --list-devices          # show the default devices, without opening them
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--send` | required | Where to send mic audio (Opus RTP) |
+| `--input` | `default` | `default`, `sine:FREQ` or `silence` |
+| `--output` | `default` | `default`, `raw:PATH` or `null` |
+| `--game` | `play` | `play`, `reference` (echo-cancel only; used on the streamer) or `off` |
+| `--bitrate` | `32000` | Opus bitrate for the mic |
+| `--muted` | off | Start muted |
+| `--no-aec`, `--no-ns`, `--no-agc` | on | Disable echo cancellation, noise suppression or automatic gain control |
+| `--echo-sim G:MS` | off | Test aid: leak G × the speaker output into the mic MS ms later |
 
 Input pacing: from stdin, frames are sent as they arrive (the encoder sets the
 pace). From a file, frames are paced at `-fps`.
@@ -786,13 +889,19 @@ GOOS=windows go vet ./...                # check the Windows build
 | `TestRTPAudioSourceReceivesOpusAndSkipsJunk` | The UDP audio input accepts Opus RTP and ignores non-RTP and RTCP datagrams |
 | `TestAudioSinkWritesOggOpus` | Viewer audio output is a valid Ogg/Opus stream containing every packet |
 | Audio in the integration tests | Every viewer receives game audio through the supernode; after a supernode hang, audio resumes through the backup |
+| `TestVoiceChatEchoCancellationEndToEnd` | Real sidecars in two viewers: B hears A; with B's speakers leaking into its mic, A's echo comes back ≥ 20 dB quieter with echo cancellation than without (measured 64 dB); muting A silences it at B |
+| `TestVoiceSidecarGetsGameAudio` | Game audio is forwarded to the sidecar (≥ 50 packets in 2 s) |
+| Rust: `cargo test` in `voice/` | RTP parsing; Opus round trip; jitter buffer ordering, wrap-around, loss concealment, late packets, latency cap; resampling; mixing and mute; echo cancellation in a simulated room (measured 76 dB reduction) |
 | `TestSampleSeesCPUAndMemory` | `-stats` reports CPU under load, drops when idle, and reports memory |
 
 The integration tests run a real signaling server and real WebRTC peers in one
 process over loopback, with a synthetic H.264 source and a synthetic Opus source (valid TOC byte,
 20 ms packets). The H.264 source has valid NAL framing with
 SPS/PPS/IDR and P-frames, and keyframes larger than the MTU so fragmentation is
-exercised. They check the bytes that reach each viewer's video and audio outputs.
+exercised. They check the bytes that reach each viewer's video and audio outputs. The
+voice tests run the real `gamecast-voice` binary (from `voice/target/debug`, or
+`GAMECAST_VOICE_BIN`) and are skipped if it hasn't been built. They measure
+tones in the recorded playback with a Goertzel filter.
 
 ---
 
@@ -816,7 +925,21 @@ gamecast/
     │   ├── source.go               Annex-B H.264 → frames; FrameSource interface
     │   ├── speedtest.go            Upload measurement against the signaling server
     │   └── integration_test.go     End-to-end and failover tests
+    │   ├── voice.go                Voice: sidecar process, voice mesh links, mute
+    │   └── voice_test.go           End-to-end voice tests with the real sidecar
     └── procstats/                  Process CPU / memory / goroutine sampling (Unix + Windows)
+
+voice/                              gamecast-voice: the Rust voice sidecar
+├── Cargo.toml                      sonora, cpal, opusic-sys (libopus), ringbuf
+├── build.rs                        Finds the system libopus via pkg-config
+└── src/
+    ├── main.rs                     Arguments, READY handshake, stdin commands, 10 ms loop
+    ├── engine.rs                   Mixing, echo reference, sonora processing, Opus encode, RTP
+    ├── jitter.rs                   Per-speaker jitter buffer with loss concealment
+    ├── io.rs                       cpal devices, synthetic inputs, raw/null outputs
+    ├── resample.rs                 Linear resampler, channel mapping
+    ├── opus.rs                     Safe libopus wrapper
+    └── rtp.rs                      Minimal RTP parse/build
 ```
 
 **Extension points:**
@@ -864,6 +987,17 @@ save roughly 0.1 of a core on the supernode, which nobody would notice. Rust
 becomes attractive when the native capture, encoding and audio work starts,
 because those use OS and C APIs that Rust can call more easily than Go.
 
+**Why a Rust sidecar for voice?** Voice chat needs echo cancellation, and the
+only production-grade canceller (WebRTC's) is C++. From Go, that means cgo and
+cross-compiling C++ for every platform. sonora is a pure-Rust port, and cpal
+covers audio devices on every OS, so the sidecar avoids C++ entirely. Go keeps
+doing what it does well: networking, with one WebRTC stack. The two processes
+talk over local UDP, which works the same on every OS.
+
+**Why a voice mesh instead of the supernode?** Voice is tiny (~32 kbps per
+stream), so the mesh costs nothing, and it keeps voice working while the video
+supernode fails over.
+
 **Why non-trickle ICE?** Simpler signaling. Its cost (gathering time) only
 applies when links are first set up, never during failover.
 
@@ -873,7 +1007,15 @@ applies when links are first set up, never during failover.
 
 - **Video comes from an ffmpeg pipe.** Keyframes can't be requested on demand, and
   parsing the pipe adds about one frame of delay.
-- **No voice chat.** Only game audio, one way, from the streamer.
+- **Voice has only been tested with synthetic audio.** Real microphones,
+  speakers and room acoustics are untested; expect 20–40 dB of echo reduction in
+  real rooms, not the 64–76 dB measured with simulated echo.
+- **Voice uses the default devices only;** no device selection, per-speaker
+  volume or push-to-talk yet.
+- **Voice loss recovery is concealment only.** Opus in-band FEC is sent but not
+  yet used on receive.
+- **The sidecar links the system libopus by default,** so the target machine
+  needs libopus installed unless it's built with `--features bundled`.
 - **Audio and video are separate outputs.** With two ffplay windows there is no
   lip sync. The planned in-app player will sync them.
 - **System audio capture through ffmpeg needs a loopback device** (see
@@ -912,7 +1054,7 @@ This is a prototype. **Don't expose it to untrusted users yet.**
 |---|---|---|
 | 1 | **Real-world testing** | Real video and audio via ffmpeg, peers on different networks, TURN, Windows |
 | 2 | **Native capture + GPU encoding** | Windows.Graphics.Capture / ScreenCaptureKit with NVENC / AMF / QSV / VideoToolbox behind `FrameSource`, plus WASAPI loopback / ScreenCaptureKit audio behind `AudioSource`: keyframes on request, no ffmpeg, no loopback device |
-| 3 | **Voice chat** | Peer-to-peer mesh (~0.3 Mbps per person); needs echo cancellation (OS voice-processing modes or the WebRTC audio processing module) |
+| 3 | **Voice polish** | Test with real devices; device selection, per-speaker volume, push-to-talk, in-band FEC recovery, static libopus in release builds |
 | 4 | **In-app player and desktop UI** | Hardware decode, vsync-paced rendering, audio/video sync; UI built on `OnTopology` |
 | 5 | **Bitrate adaptation** | From congestion feedback (TWCC/REMB); temporal SVC so weak viewers get 30 fps |
 | 6 | **Security** | Room tokens, `wss://`, SFrame end-to-end encryption |
@@ -937,6 +1079,10 @@ This is a prototype. **Don't expose it to untrusted users yet.**
 | No audio on viewers | Check the streamer logged `game audio: listening for Opus RTP on …` and that ffmpeg sends to that exact address. The viewer needs `-audio-out`. |
 | `audio input …: address already in use` | Another process uses the port (or port+1 is taken, which is only a warning). Pick another `-audio-in` port and match it in ffmpeg. |
 | A viewer hangs at startup with `-audio-out` on a named pipe | Opening a named pipe waits for a reader. Start ffplay on the pipe first. |
+| `-voice: gamecast-voice not found …` | Build the sidecar (`cargo build --release` in `voice/`) and copy it next to `gamecast`, or pass `-voice-bin`. |
+| Sidecar fails to start: library not loaded / `libopus` | It links the system libopus. Install it, or build with `cargo build --release --features bundled`. |
+| `voice: error: no microphone found` | No default input device. Use `-voice-input silence` to listen only. |
+| Others hear themselves echo | The echo canceller needs a few seconds to adapt. Make sure game audio is played by the sidecar (`-voice`), not by a separate player, so it's in the echo reference. |
 | Stream stutters for everyone | The supernode's upload is saturated. Check `-stats` and the router; enable SQM/QoS. |
 
 ## FAQ
@@ -945,9 +1091,9 @@ This is a prototype. **Don't expose it to untrusted users yet.**
 supernode's upload: each viewer adds about 10 Mbps. Beyond about 10 viewers, use
 a real SFU.
 
-**Is there voice chat?** Not yet. Game audio goes one way from the streamer.
-Voice chat is planned as a separate peer-to-peer mesh; it needs echo
-cancellation, which the WebRTC library used here doesn't provide.
+**Is there voice chat?** Yes: add `-voice`. Everyone with `-voice` is in one
+voice mesh, with echo cancellation, noise suppression and automatic gain
+control done by the Rust sidecar.
 
 **Can viewers watch in a browser?** Not yet. The protocol is plain WebRTC, so a
 browser viewer is possible, but it would need a small web client and matching
@@ -970,6 +1116,7 @@ resume playback, but it isn't covered by a test yet.
 - Format and check: `gofmt -l .` (no output), `go vet ./...`, and
   `GOOS=windows go vet ./...`
 - Tests must pass with the race detector: `go test -race ./...`
+- Sidecar: `cargo fmt`, `cargo clippy --all-targets` (no warnings), `cargo test`
 - Commit messages follow `type(scope): summary`, for example
   `feat(peer): …`, `fix(signaling): …`, `docs: …`, `chore: …`
 

@@ -1,5 +1,7 @@
 # Build output (go build -o bin/gamecast ./cmd/gamecast)
 bin/
+# Rust voice sidecar build output
+voice/target/
 # go build ./cmd/gamecast run from this directory drops the binary here
 /gamecast
 /gamecast.exe

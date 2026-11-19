@@ -13,7 +13,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -109,6 +112,13 @@ func runPeer(ctx context.Context, role string, args []string) error {
 	canHost := fs.Bool("host", false, "watch: volunteer this PC as supernode")
 	out := fs.String("out", "-", "watch: write received H.264 here ('-' = stdout, '' = discard)")
 	audioOut := fs.String("audio-out", "", "watch: write received game audio as Ogg/Opus here (file or named pipe; '-' = stdout if -out isn't; '' = none)")
+
+	// voice chat (both commands)
+	voice := fs.Bool("voice", false, "join voice chat (runs the gamecast-voice sidecar)")
+	voiceBin := fs.String("voice-bin", "", "path to gamecast-voice (default: next to this binary, then $PATH)")
+	voiceIn := fs.String("voice-input", "default", "voice: microphone: default | sine:FREQ | silence")
+	voiceOut := fs.String("voice-output", "default", "voice: playback: default | raw:PATH | null")
+	voiceMuted := fs.Bool("voice-muted", false, "voice: start with the microphone muted")
 	_ = fs.Parse(args)
 	go procstats.Log(ctx, *stats, log.Printf)
 
@@ -199,6 +209,18 @@ func runPeer(ctx context.Context, role string, args []string) error {
 		}
 	}
 
+	if *voice {
+		bin, err := findVoiceBin(*voiceBin)
+		if err != nil {
+			return err
+		}
+		cfg.Voice = &peer.VoiceConfig{
+			Bin:   bin,
+			Args:  []string{"--input", *voiceIn, "--output", *voiceOut},
+			Muted: *voiceMuted,
+		}
+	}
+
 	c, err := peer.New(cfg)
 	if err != nil {
 		return err
@@ -230,4 +252,26 @@ func parseICE(s string) []webrtc.ICEServer {
 func hostname() string {
 	h, _ := os.Hostname()
 	return h
+}
+
+// findVoiceBin locates the gamecast-voice sidecar: the flag, then next to
+// this executable, then $PATH.
+func findVoiceBin(flagPath string) (string, error) {
+	if flagPath != "" {
+		return flagPath, nil
+	}
+	name := "gamecast-voice"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	if exe, err := os.Executable(); err == nil {
+		p := filepath.Join(filepath.Dir(exe), name)
+		if _, err := os.Stat(p); err == nil {
+			return p, nil
+		}
+	}
+	if p, err := exec.LookPath(name); err == nil {
+		return p, nil
+	}
+	return "", fmt.Errorf("-voice: %s not found next to gamecast or in $PATH (build it with `cargo build --release` in voice/, or pass -voice-bin)", name)
 }

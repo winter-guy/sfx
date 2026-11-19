@@ -356,8 +356,15 @@ func (c *Client) receiveAudio(l *link, track *webrtc.TrackRemote) {
 		if c.fwdFrom.Load().(string) == l.peer {
 			_ = c.fwdAudio.WriteRTP(pkt)
 		}
-		if c.audioOut != nil && c.playFrom.Load().(string) == l.peer {
-			c.audioOut.WriteRTP(pkt)
+		if c.playFrom.Load().(string) == l.peer {
+			if c.audioOut != nil {
+				c.audioOut.WriteRTP(pkt)
+			}
+			if v := c.voice.Load(); v != nil {
+				if b, err := pkt.Marshal(); err == nil {
+					v.sendGame(b) // the sidecar plays it and echo-cancels it
+				}
+			}
 		}
 	}
 }

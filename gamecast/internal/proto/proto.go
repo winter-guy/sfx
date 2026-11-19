@@ -39,6 +39,7 @@ type Join struct {
 	Wired       bool    `json:"wired"`
 	CanHost     bool    `json:"canHost"`               // viewer opted in to act as supernode
 	BitrateKbps int     `json:"bitrateKbps,omitempty"` // streamer only: target video bitrate
+	Voice       bool    `json:"voice,omitempty"`       // takes part in voice chat
 }
 
 // Topology is the server's decision about how media flows in a room.
@@ -53,6 +54,7 @@ type Topology struct {
 	Host        string            `json:"host"`
 	Backup      string            `json:"backup"` // warm standby supernode (may be the streamer)
 	Viewers     []string          `json:"viewers"`
+	Voice       []string          `json:"voice,omitempty"` // peers in voice chat (full mesh)
 	Names       map[string]string `json:"names"`
 	BitrateKbps int               `json:"bitrateKbps"`
 	Degraded    bool              `json:"degraded"` // no candidate had enough upload
