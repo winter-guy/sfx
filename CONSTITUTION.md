@@ -1,7 +1,7 @@
 # Constitution
 
 The rules every change in this repo follows. Product decisions come from
-[cast/AGENT_PROTOCOL.md](cast/AGENT_PROTOCOL.md#decisions) (`D1`–`D10`); this
+[cast/AGENT_PROTOCOL.md](cast/AGENT_PROTOCOL.md#decisions) (`D1`–`D14`); this
 page repeats the ones that constrain all work and adds the engineering and
 working rules. If a change needs to break a rule, change this page first, in
 its own commit, with the reason.
@@ -9,8 +9,9 @@ its own commit, with the reason.
 ## Product
 
 1. **Small groups, peer to peer.** The target is H.264 1080p60 game streaming
-   to about 10 people. Media flows between the participants' PCs; the
-   signaling server never carries audio or video.
+   in rooms of at most 10 people (D11). Media flows between the participants'
+   PCs; the signaling server never carries audio or video, except through its
+   optional TURN server for members who hide their IP (D12).
 2. **The mic belongs to the user** (D2). Nothing in the core mutes, unmutes or
    changes the mic mode on its own: not on a hang, a failure, a reconnect or a
    join. Push-to-talk on first install; the app remembers the user's choice.
@@ -19,8 +20,11 @@ its own commit, with the reason.
    the sidecar.
 4. **Every stream has its own tree** (D5). Something happening to one stream
    never changes another. Streamers are the last choice as supernode (D7).
-5. **One session per process, controlled over stdio** (D1, D10).
-6. **Out of scope until decided otherwise:** chat (D3), watching while streaming
+5. **Relaying for others is the member's choice** (D13), and when upload falls
+   short, extra watchers wait rather than everyone stuttering (D14). Nobody,
+   the streamer least of all, is made to send more than they can carry.
+6. **One session per process, controlled over stdio** (D1, D10).
+7. **Out of scope until decided otherwise:** chat (D3), watching while streaming
    (D8), a media server.
 
 ## Engineering
