@@ -25,6 +25,7 @@ decisions in [cast/AGENT_PROTOCOL.md](../cast/AGENT_PROTOCOL.md#decisions).
 - [When things are checked](#when-things-are-checked)
 - [Failure cases](#failure-cases)
 - [What it costs](#what-it-costs)
+- [Compute cost](#compute-cost)
 - [Changes to the spec](#changes-to-the-spec)
 - [Changes to the code](#changes-to-the-code)
 - [Phases](#phases)
@@ -221,6 +222,14 @@ certificates), so the fingerprint in its SDP identifies it.
 P-256 because it's the one curve that TPM 2.0, Apple's Secure Enclave and
 WebRTC certificates all support.
 
+**Session certificate.** Hardware keys sign slowly, and a join opens 9
+connections, each with a DTLS handshake that needs a signature. So the
+hardware-held device key signs **once per app start**: it certifies a
+short-lived software key, and that software key is the WebRTC certificate
+for the session. Handshakes then cost about 14 µs each instead of a hardware
+signature each. The member list records the device key; the session
+certificate carries the device key's signature, which peers check.
+
 **Room key.** The member who creates the room generates a room key pair
 (P-256). **Room ID** = the first 128 bits of SHA-256 of the room public key,
 base32-encoded. Every member's copy holds the room key (proposed; see
@@ -390,6 +399,52 @@ remains are distribution costs (Apple notarization, Windows code signing).
 
 ---
 
+## Compute cost
+
+Measured with the mesh measurement program (10 members in one process,
+loopback, Pion v4.2.27 with `cast`'s codecs, ICE settings and default
+interceptors; 30 s per phase; dev Mac) plus Go benchmarks. Per member, idle
+(no media):
+
+| Step | Memory | CPU (one core) | Goroutines per connection |
+|---|---|---|---|
+| Today: voice mesh | 1.6 MB | 0.63% | 16 |
+| + [mesh](mesh.md) (idle video and game audio) | 2.2 MB | 0.69% | 18 |
+| + a data channel per connection | 3.05 MB | 0.68% | 23 |
+| + control traffic (status and beacon, 4 per second) | **3.3 MB** | **0.88% average** | 23 |
+
+With everyone's voice live on top: 3.4 MB and 3.56% per member (3.38%
+without the data channels and control traffic).
+
+**Where the control CPU lands.** Control traffic added 2.0% of one core
+across the whole room. The coordinator takes part in half of all control
+messages (9 statuses in, 9 beacons out every 250 ms), so by that split it
+carries about **1% of a core**, and every other member about **0.1%**. The
+split is derived, not measured separately. Members already send the same
+status messages to `cast signal` today, over WebSocket, so the real increase
+for them is smaller.
+
+**Everything else (benchmarks):**
+
+| Work | Cost | How often | Total |
+|---|---|---|---|
+| Election for one stream, 10 members (today's `ElectPair`) | ≈ 1 µs | On changes | Negligible; the exact tree search proposed in [supernode-election.md](supernode-election.md) would be hundreds of µs, still negligible |
+| Decoding one status message (JSON) | ≈ 1.2 µs | 36 per second at the coordinator | ≈ 0.004% of a core |
+| P-256 signature (software) | ≈ 14 µs | Rejoin challenge; DTLS handshakes (Pion already signs these today) | Negligible |
+| P-256 verification (software) | ≈ 33 µs | Member list changes, invites, handshakes | 10 entries ≈ 0.3 ms at join |
+| Doorbell and STUN listeners | Idle goroutines | A few packets per join | Negligible |
+| Port-mapping lease renewal, mDNS answers | A few packets | Minutes apart | Negligible |
+
+**Not measured yet:** TPM and Secure Enclave signing time (typically far
+slower than software, and it varies by chip), port mapping on real routers,
+and all of this on a Windows gaming PC.
+
+**Summary:** about **+0.8 MB per member** for the data channels, about
+**+0.1% of a core per member**, and about **+1% of a core on whichever member
+is coordinator**. The project's server cost goes to zero.
+
+---
+
 ## Changes to the spec
 
 [cast/AGENT_PROTOCOL.md](../cast/AGENT_PROTOCOL.md):
@@ -435,7 +490,7 @@ remains are distribution costs (Apple notarization, Windows code signing).
 
 | Phase | What | Measured / tested |
 |---|---|---|
-| 0 | **Measure:** add a data channel to the mesh measurement program; try port mapping on a few real routers | Data channel memory and CPU per connection; how often mapping works |
+| 0 | **Measure:** data channel cost (done on the dev Mac: [compute cost](#compute-cost)); repeat on a Windows gaming PC; TPM and Secure Enclave signing time; port mapping on a few real routers | Numbers on real hardware; how often mapping works |
 | 1 | **Identity:** device key (software first), `clientId` from it, WebRTC certificate from it | Fingerprint check on connect |
 | 2 | **Control over the mesh:** data channels carry status, SDP relay and topology | Existing failover tests pass with control over the mesh |
 | 3 | **Coordinator in a member:** embed today's server logic; handover and takeover | Coordinator crash → takeover ≤ 1 s; handover with no visible effect |
