@@ -1,8 +1,11 @@
 # A connection between every pair of members
 
-**Status:** brainstorm, with first decisions: **room cap 10**, **"hide my
-IP" for streamers** ([cost](#hide-my-ip-what-it-costs)), **slower keepalive
-on battery** ([details](#keepalive-and-battery)). Answers open question 2 of
+**Status:** proposal. Decided in
+[the spec](../cast/AGENT_PROTOCOL.md#decisions): **room cap 10** (D11),
+**"hide my IP"** with a TURN server built into `cast signal` (D12,
+[cost](#hide-my-ip-what-it-costs)). **Not adopted:** the slower keepalive on
+battery ([why](#keepalive-and-battery)). The mesh itself waits on
+real-hardware measurements. Answers open question 2 of
 [supernode-election.md](supernode-election.md#open-questions).
 **Question:** in a room of 10, should every pair of members keep one
 WebRTC connection open all the time, carrying voice plus an idle video track
@@ -41,14 +44,16 @@ track swaps instead of new connections.
 - **Faster.** Watching, switching streams, starting a stream and replacing a
   relay become track swaps plus a keyframe, with no SDP exchange and no new
   connection.
-- **A pair never carries video both ways at once.** That's provable from D6
-  and D8, so one video and one game-audio track per direction is always
-  enough, and the connection never needs renegotiating after setup.
+- **A pair never carries video both ways at once.** That's provable from D6,
+  D8 and seed-only pure seeders, so one video and one game-audio track per
+  direction is always enough, and the connection never needs renegotiating
+  after setup.
 - **The real cost is privacy:** every member learns every other member's IP
   address, the streamer's included. The fix is a per-member "hide my IP"
   option (TURN only), not a smaller mesh.
-- **Decided:** full mesh, rooms capped at **10 members**, streamers hidden
-  behind TURN, keepalive slowed on battery where it pays off.
+- **Decided:** rooms capped at **10 members** (D11); "hide my IP" with a TURN
+  server built into `cast signal` (D12). **Proposed:** the full mesh, once
+  measured on real hardware. **Not adopted:** a slower keepalive on battery.
 
 ---
 
@@ -99,9 +104,10 @@ audio. Video and game audio always move together, so call them "media".
 - `u → v` media means `u` is `v`'s parent in some stream's tree. So `v`
   watches that stream, and `u` either streams it or watches it too.
 - `v → u` media at the same time would make `v` the parent of `u` in the
-  same stream, because each member is in at most one tree (D6, D8). A parent
-  of your parent can't also be your child, so that's a cycle, which a tree
-  can't have.
+  same stream, because each member is in at most one tree: as streamer, as
+  watcher (D6, D8), or as seed-only relay (pure seeding is limited to members
+  who watch nothing). A parent of your parent can't also be your child, so
+  that's a cycle, which a tree can't have.
 
 So each pair is in one of **six states**:
 
@@ -135,7 +141,7 @@ What one member's 9 connections are doing, for every kind of member:
 | Watching, relaying | On | 1 | `k` | 1 + `k` + voice |
 | Streaming | Off | 0 | 1 (2 if allowed) | 1–2 |
 | Streaming | On | 0 | 1–2 | 1–2 + voice |
-| Pure seeder (relays a stream it doesn't watch) | Off / On | 1 | `k` | 1 + `k` (+ voice) |
+| Seed-only relay (watches nothing, relays one stream) | Off / On | 1 | `k` | 1 + `k` (+ voice) |
 
 The connection count doesn't depend on the row: it's always 9.
 
@@ -183,7 +189,7 @@ connections (today) = v(v − 1)/2 + Σ over streams of (w ≤ 1 ? w : 2w)
   group of friends, the mesh has *fewer* connections than today**, because
   voice and video share one connection per pair.
 - The mesh costs more only when few people are in voice (rows 1, 4, 9, 10).
-  The extra is at most 45 idle connections, which at 2.2 MB and 0.65% of a
+  The extra is at most 45 idle connections, which at 2.2 MB and 0.7% of a
   core per member is small.
 - **Per member**, today's design is lopsided: a host in row 3 holds 19
   connections (9 voice, 1 in, 8 out, 1 standby in). In the mesh, everyone
@@ -246,10 +252,10 @@ gain.
    - The election treats a hidden member's edges as TURN edges (higher
      latency), so it's rarely picked as a relay.
 2. **Grows as n².** Fine at 10 (45 pairs). See [Room size](#room-size).
-3. **Laptop power.** 0.65% of a core sounds small, but it's constant
+3. **Laptop power.** 0.7% of a core sounds small, but it's constant
    wake-ups from keepalives and timers on 9 connections. Worth measuring on
-   battery. Keepalive could be slower on pairs that carry nothing, if Pion
-   allows it per connection.
+   battery. A slower keepalive was considered and
+   [not adopted](#keepalive-and-battery).
 4. **Join cost.** A new member opens 9 connections at once. Each one
    gathers candidates and does a DTLS handshake. In parallel that's fine, but
    on a slow machine or bad network the member's edges come up one by one.
@@ -268,7 +274,7 @@ gain.
 
 ## Room size
 
-**Decided: 10 members per room.** For reference, scaling the measured
+**Decided (D11): 10 members per room.** For reference, scaling the measured
 per-connection cost (≈ 250 KB and ≈ 0.08% of a core per idle connection;
 ≈ 0.37% per live voice peer):
 
@@ -315,7 +321,7 @@ IP" is a **per-member setting applied at join**:
 
 | Cost | Amount | Notes |
 |---|---|---|
-| A TURN server | We don't run one today (only a public STUN server) | `pion/turn` or coturn on a small VPS; two of them in different regions for redundancy |
+| A TURN server | Decided (D12): `cast signal -turn` runs one in the signaling binary (`pion/turn`), handing out short-lived credentials in `welcome`. Today there is only a public STUN server | Whoever runs the signaling server pays the traffic below; UDP 3478 and a relay port range must be open. A second server in another region for redundancy; `network.ice` can point elsewhere |
 | TURN traffic, video | **≈ 3.7 GB per hour** in and the same out, per copy (8.1 Mbps) | Budget 2 copies → double |
 | TURN traffic, voice | ≈ 0.2 GB per hour each way | Voice to and from 9 peers at ≈ 50 kbps each |
 | Total TURN egress | **≈ 4 GB per streamer-hour** (1 copy) | 4 hidden streamers ≈ 16 GB per hour and ≈ 36 Mbps sustained through the server |
@@ -329,12 +335,38 @@ IP" is a **per-member setting applied at join**:
 still see each other's. Hiding is per member; anyone can turn it on, at the
 same TURN cost for the copies they send.
 
+**Without a TURN server**, a join with `hideIp` fails with `turn_unavailable`;
+the core never falls back to exposing the address.
+
+**LAN addresses.** mDNS candidates would hide LAN addresses, but `cast`
+disables mDNS on purpose (`peer/media.go`): it fails on networks that block
+multicast, which would push friends on the same LAN onto hairpin NAT paths
+many routers don't support. A private LAN address reveals little. Host
+candidates stay.
+
 ---
 
 ## Keepalive and battery
 
-**Proposal:** turn the keepalive off on battery, back on when plugged in;
-not for ARM laptops, whose efficiency cores make it cheap.
+**Outcome: not adopted.** The keepalive stays at 1 s everywhere. The idea is
+parked in [later.md](later.md), behind a battery measurement that shows real
+drain. Why, in short:
+
+- `cast` builds every connection with ICE timeouts of 3 s (disconnected) and
+  6 s (failed) (`SetICETimeouts` in `peer/media.go`). With a 15 s keepalive,
+  an idle pair hears nothing for 15 s and is declared failed, the same
+  problem as switching it off. Slowing it means raising those timeouts on
+  those connections too, so a dead idle pair is noticed after about 45 s.
+- It only saves anything when **both** ends are on battery: a peer on a 1 s
+  keepalive still wakes the battery side every second.
+- The measured gain is 0.17% of a core per member, for three new mechanisms
+  (per-connection intervals, per-connection timeouts, rebuilding idle pairs
+  on a power change).
+
+The analysis that led there follows.
+
+**Original proposal:** turn the keepalive off on battery, back on when
+plugged in; not for ARM laptops, whose efficiency cores make it cheap.
 
 **What the keepalive does** (checked in `pion/ice` v4.4.9): every interval,
 each side sends a STUN request on the pair it uses, whether or not other
@@ -406,15 +438,14 @@ briefly, so the saving isn't zero, just smaller.
    transceivers per direction (voice, video, game audio), negotiated once at
    join and never renegotiated. Video and game audio idle until the tree says
    otherwise.
-2. **Decided: a room cap of 10 members**, enforced by the server
+2. **Decided (D11): a room cap of 10 members**, enforced by the server
    (`room_full`).
-3. **Decided: "hide my IP" for streamers**, as a per-member setting applied
-   at join: on by default for anyone who has streamed before, asked on a
-   first stream, remembered by the app. Needs a TURN server
-   ([cost](#hide-my-ip-what-it-costs)).
-4. **Keepalive: 1 s, or 15 s on battery without efficiency cores**, chosen
-   per connection at creation; idle pairs rebuilt on a power change
-   ([details](#keepalive-and-battery)).
+3. **Decided (D12): "hide my IP"**, as a per-member setting applied at join:
+   on by default for anyone who has streamed before, asked on a first
+   stream, remembered by the app. The TURN server is built into
+   `cast signal` ([cost](#hide-my-ip-what-it-costs)).
+4. **Keepalive: 1 s everywhere.** The battery variant is not adopted
+   ([why](#keepalive-and-battery)).
 5. **Usable edges only:** the election uses an edge once it's connected and
    has an RTT.
 6. **Measure on real hardware** before building: the same program on a
@@ -423,9 +454,11 @@ briefly, so the saving isn't zero, just smaller.
 
 **How this changes the plans:**
 
-- [multi-stream.md](multi-stream.md) Phase 4 would build video links from
-  the mesh (swap tracks) instead of opening per-tree connections. The voice
-  link code (`peer/voice.go`) becomes the general mesh.
+- [multi-stream.md](multi-stream.md) doesn't wait for the mesh: its Phase 4
+  keeps per-tree connections. If the mesh is adopted, it replaces how video
+  links are built (swap tracks instead of opening connections), behind the
+  same `reconcileLocked` entry point, and the voice link code
+  (`peer/voice.go`) becomes the general mesh.
 - [supernode-election.md](supernode-election.md): failover design B is this
   mesh; open question 2 is answered here.
 
@@ -433,10 +466,9 @@ briefly, so the saving isn't zero, just smaller.
 
 ## Open questions
 
-1. **Who runs TURN?** "Hide my IP" needs a TURN server: hosted by the
-   project, by each group, or both? This decides who pays the ≈ 4 GB per
-   streamer-hour.
-2. **Upstream Pion change** for a runtime keepalive interval: worth
-   proposing, or is rebuilding idle pairs enough?
-3. **Room-full behaviour:** refuse the eleventh member (`room_full`), or
-   let them wait in a queue?
+1. ~~Who runs TURN?~~ **Decided (D12):** the signaling server
+   (`cast signal -turn`); whoever runs it pays the ≈ 4 GB per streamer-hour.
+2. ~~Upstream Pion change for a runtime keepalive interval~~ Moot: the
+   battery keepalive is not adopted.
+3. **Room-full behaviour:** refuse the eleventh member (`room_full`, as
+   decided for now), or later let them wait in a queue?
