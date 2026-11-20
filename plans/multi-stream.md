@@ -1,7 +1,9 @@
 # Plan: several streams per room
 
-**Implements:** decisions D5–D9 of [cast/AGENT_PROTOCOL.md](../cast/AGENT_PROTOCOL.md#decisions),
-changes #6–#9 of its [change list](../cast/AGENT_PROTOCOL.md#changes-required-in-the-current-code).
+**Implements:** decisions D5–D9 and D11 of [cast/AGENT_PROTOCOL.md](../cast/AGENT_PROTOCOL.md#decisions),
+changes #6–#9 and #18 of its [change list](../cast/AGENT_PROTOCOL.md#changes-required-in-the-current-code).
+Step 1 of the spec's order. Mic modes (#10) run in parallel on their own
+branch once Phase 1 has merged.
 **Follows:** [CONSTITUTION.md](../CONSTITUTION.md).
 **Branch:** `feat/multi-stream`.
 
@@ -18,8 +20,14 @@ pass and their measured numbers are recorded in the spec and the README.
 ## Not in this plan
 
 The `cast agent` command (#1), stable `clientId` and reconnect (#4, #5), mic
-modes (#10), pause and game-audio toggles, and the moderation methods. Streams
-are identified by the streamer's **peer ID** until `clientId` exists.
+modes (#10), pause and game-audio toggles, the degraded tiers (#20, with the
+tree election), and the moderation methods. Streams are identified by the
+streamer's **peer ID** until `clientId` exists.
+
+**Links stay per tree.** The [mesh](mesh.md) (one connection per pair) would
+later replace how Phase 4 builds video links, behind the same
+`reconcileLocked` entry point. This plan doesn't wait for it: the mesh needs
+real-hardware measurements first, and Phase 4 reuses today's link code.
 
 ## Where the code is today
 
@@ -49,17 +57,26 @@ existing `reconcileLocked` on it. Links don't need to be keyed by stream.
    suspects, stallSince, bitrate). `checkHost` and the election take a
    `*stream`; their logic doesn't change.
 3. **Watchers are explicit.** The server keeps `peer.watching` (a streamer ID
-   or empty). A stream's viewers are exactly the peers watching it.
+   or empty, plus the `video` and `gameAudio` flags). A stream's viewers are
+   exactly the peers watching it. Only video watchers are host candidates and
+   count for the single-watcher rule; an audio-only watcher is a child in the
+   tree that gets game audio only (128 kbps, not a video copy).
 4. **New client → server messages** `stream` (start or stop) and `watch`
-   (streamer ID, or empty to stop), answered with a non-fatal `result` that
-   echoes a client-chosen `ref` and may carry an error type such as
-   `stream_limit`. Today `error` is fatal and ends the client.
+   (streamer ID and flags, or empty to stop), answered with a non-fatal
+   `result` that echoes a client-chosen `ref` and may carry an error type such
+   as `stream_limit`. Today `error` is fatal and ends the client.
 5. **Server-side cleanup.** When a stream ends (stop, leave, timeout) the
    server clears `watching` on its watchers. When a watcher starts a stream,
    the server clears its `watching` (D8).
 6. **Sidecar game mode follows the client's state**: streaming → `reference`,
    watching → `play`, neither → `off`. The mic delay follows the mode unless
    `--mic-delay` was given explicitly.
+7. **Expand, migrate, contract.** Phase 3 adds the new protocol **beside** the
+   old one, so every commit builds and the existing integration tests check
+   the new server unchanged; Phase 4 moves the client over; the old fields
+   go in a final commit.
+8. **Room cap (D11).** `maxMembers` sits next to `maxStreams`; a join beyond
+   it gets `room_full`.
 
 ## Phases
 
@@ -101,35 +118,44 @@ Commit: `feat(signaling): make the streamer the last choice as supernode`.
 
 ### Phase 3: several streams on the server (#6, #7 server side)
 
-- `proto`:
-  - `Join`: `Role` is removed; a peer joins as a plain participant and
-    starts streaming or watching with the messages below.
+- `proto` (additive; nothing is removed in this phase):
   - New types `stream` (`{action: "start"|"stop", bitrateKbps}`), `watch`
-    (`{streamer}`), `result` (`{ref, error}`); `Message.Ref`.
+    (`{streamer, video, gameAudio}`), `result` (`{ref, error}`); `Message.Ref`.
   - `Topology`: `Streams []StreamTopology` (`Streamer`, `Host`, `Backup`,
-    `Watchers`, `BitrateKbps`, `Epoch`, `Degraded`, `Reason`) and
-    `MaxStreams`; `Voice` and `Names` stay room-wide. The single-stream fields
-    are removed.
+    `Watchers` with their flags, `BitrateKbps`, `Epoch`, `Degraded`, `Reason`),
+    `MaxStreams` and `MaxMembers`; `Voice` and `Names` stay room-wide.
+  - `Join.Role` and the single-stream `Topology` fields **stay** for now.
+- **Compatibility shim** in `server.go`: a join with `Role: streamer` is an
+  automatic `stream start`; `Role: viewer` is an automatic `watch` of the only
+  stream, or of the first one that starts. The single-stream fields are filled
+  from that stream. Every existing integration test runs unchanged against
+  the new server.
 - `server.go`:
   - `room.streams map[string]*stream`; `peer.watching`, `peer.streaming`.
   - `stream start`: refuse with `stream_limit` (and the current streamers) at
     `maxStreams`, or `already_streaming`; clear the peer's `watching`.
   - `stream stop` / leave: delete the stream, clear its watchers.
   - `watch`: `unknown_stream` if not live, `watch_while_streaming` if the
-    peer streams; otherwise set `watching`.
+    peer streams, invalid if both flags are false; otherwise set `watching`.
+    A `watch` for the stream already watched only changes the flags.
+  - Join: `room_full` at `maxMembers`.
   - `reconcile`: elect per stream from that stream's watchers; bump that
     stream's epoch only when its host or streamer changes.
   - `monitor`: loop over rooms, then streams; `checkHost(stream)` counts only
     watchers whose status upstream is that host.
-- `cmd/cast`: `signal -max-streams 4`.
+- `cmd/cast`: `signal -max-streams 4 -max-members 10`.
 - **Tests** (new `server_test.go`, WebSocket clients against `httptest`):
-  limit reached → `stream_limit` with the streamer list; watch switches move
-  the peer between `Watchers` lists; a host failure in stream A changes A's
-  epoch and not B's; stopping a stream empties its watchers.
+  limit reached → `stream_limit` with the streamer list; the eleventh join →
+  `room_full`; watch switches move the peer between `Watchers` lists; an
+  audio-only watcher is never elected host; a host failure in stream A
+  changes A's epoch and not B's; stopping a stream empties its watchers; the
+  shim maps `Role` joins onto streams. The existing `peer` integration tests
+  pass unchanged.
 
 Commits: `feat(proto): describe several streams per room`,
 `feat(signaling): run one tree per stream with a room stream limit`,
-`feat(cli): add -max-streams to the signal server`.
+`feat(signaling): cap rooms at maxMembers`,
+`feat(cli): add -max-streams and -max-members to the signal server`.
 
 ### Phase 4: streaming and watching as client state (#6, #7 client side)
 
@@ -141,8 +167,10 @@ Commits: `feat(proto): describe several streams per room`,
     `StopStream()`: send the `stream` message, wait for its `result`, start or
     stop `pumpFrames` / `pumpAudio` (with their own cancel func), set the
     sidecar game mode.
-  - `Watch(streamer)` / `Unwatch()`: send `watch`, wait for `result`, set the
-    sidecar game mode.
+  - `Watch(streamer, video, gameAudio)` / `Unwatch()`: send `watch`, wait for
+    `result`, set the sidecar game mode.
+  - A parent keeps its video sender on the idle track for an audio-only
+    child (the same swap the backup uses).
   - `applyTopology`: pick my stream (the one I stream, or the one I watch)
     and pass it to `reconcileLocked`, which keeps its current logic with
     `Viewers` = that stream's watchers. No stream → no video links.
@@ -150,9 +178,11 @@ Commits: `feat(proto): describe several streams per room`,
 - `cmd/cast`:
   - `cast stream` = join, then `StartStream`; exits as today when the source
     ends.
-  - `cast watch -stream NAME`: watch that streamer; without `-stream`, watch
-    the only live stream and wait for one if none is live; if several are live,
-    list them and exit with an error.
+  - `cast watch -stream X`: watch that streamer, where X is a peer ID or a
+    name; a name shared by several streamers exits with the matches and their
+    IDs. Without `-stream`, watch the only live stream and wait for one if
+    none is live; if several are live, list them and exit with an error.
+    `-audio-only` sets `video: false`.
 - **Tests:** existing failover tests still pass unchanged in behaviour (they
   now call `StartStream` / `Watch`); a client stops streaming and its voice
   links stay connected.
@@ -180,14 +210,19 @@ Then update:
 - `cast/README.md`: architecture and failover sections for several streams,
   the new flags, the measured numbers.
 
+**Contract:** remove `Join.Role`, the single-stream `Topology` fields and the
+shim, now that nothing uses them.
+
 Commits: `test(peer): cover several streams, switching and voice continuity`,
+`refactor(proto): remove the single-stream fields and the role shim`,
 `docs: document several streams per room`.
 
 ## Risks
 
 | Risk | Mitigation |
 |---|---|
-| A watcher with little upload ends up the only qualifying host and every tree gets slower | The election already falls back to the streamer and then degraded mode; covered by the existing degraded tests |
+| A watcher with little upload ends up the only qualifying host and every tree gets slower | The election already falls back to the streamer and then degraded mode; covered by the existing degraded tests. The degraded tiers (D14) come later, with the tree election |
+| The compatibility shim hides a behaviour change | The shim only exists between Phases 3 and 5; Phase 5's tests use the new messages, and the contract commit deletes it |
 | Topology messages grow with every stream | 10 peers and 4 streams is a few kilobytes; measure in `TestTwoStreamsIndependent` and revisit only if it matters |
 | Two quick switches race: an offer for the old tree arrives after the new topology | Already handled: stale link IDs are ignored and pending offers are dropped when their sender isn't in my tree (the same rule as voice) |
 | Mic delay change on mode switch clips a syllable | One glitch of at most 80 ms per switch; documented; only when the delay is the automatic one |

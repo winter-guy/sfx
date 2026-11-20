@@ -1,8 +1,11 @@
 # Supernode election: research and proposal
 
-**Status:** brainstorm, for discussion. Nothing here is decided until it is
-moved into [cast/AGENT_PROTOCOL.md](../cast/AGENT_PROTOCOL.md#decisions) as a
-decision.
+**Status:** proposal, partly decided. Decided in
+[cast/AGENT_PROTOCOL.md](../cast/AGENT_PROTOCOL.md#decisions): relaying is
+opt-in with a just-in-time prompt (D13), and the degraded tiers (D14). Decided
+here: pure seeding only for members who watch nothing. The rest is still a
+proposal; the reasoning behind the changes is in
+[review-resolutions.md](review-resolutions.md). Step 7 of the spec's order.
 **Scope:** how each stream's tree is built (who relays to whom), what each
 node measures and when, and how members control what they share.
 
@@ -33,26 +36,29 @@ node measures and when, and how members control what they share.
 ## Summary
 
 1. **Build a tree, not a star.** Each stream gets a small tree of relays
-   (depth 2, at most 3) instead of one supernode serving everyone. At our size
-   (≤ 10 people) the best tree can be found **exactly**, in microseconds.
+   (depth ≤ 3) instead of one supernode serving everyone. At our size
+   (≤ 10 people) the best tree can be found **exactly**, in milliseconds
+   (prototyped: [The algorithm](#the-algorithm)).
 2. **Optimise latency under capacity limits.** Every node's resources become
    one number, the **copies it can send**. The election then minimises the
    worst viewer's latency without exceeding anyone's copies. No weighted
    scores mixing Mbps, CPU % and milliseconds.
 3. **Latency is free.** Every pair of peers already has an ICE connection
-   (the voice mesh), and ICE measures its round-trip time every 2 s. Extend
-   the mesh to every member and the full latency matrix costs nothing.
+   (the voice mesh), and ICE measures its round-trip time every second (the
+   keepalive `cast` sets; Pion's default is 2 s). Extend the mesh to every
+   member and the full latency matrix costs nothing.
 4. **The streamer sends one copy by default** and relays nothing else. It
    may allow a second copy, which the worked example shows can cut the worst
    viewer's latency by 20%.
-5. **Seeding is an explicit, capped opt-in:** `off`, or `on` with an upload
-   cap in Mbps (shown as "≈ N viewers at 1080p60" and "≈ X GB per hour").
+5. **Seeding is an explicit, capped opt-in** (D13): `off` by default, or `on`
+   with an upload cap in Mbps (shown as "≈ N viewers at 1080p60" and "≈ X GB
+   per hour"), asked when a stream the member watches is short of relays.
    The cap is enforced by the shape of the tree, never by dropping packets.
-6. **Measure passively; probe rarely and precisely.** The 250 ms heartbeat
-   never waits for anything; it carries the latest cached metrics. Live
-   traffic and OS counters are read continuously. An active upload probe
-   runs only on join, after a network change, and **before promoting a node
-   to more copies than it has proven**, over the exact links it would use.
+6. **Measure passively; promote gradually.** The 250 ms heartbeat never
+   waits for anything; it carries the latest cached metrics. Live traffic and
+   OS counters are read continuously. An upload probe runs only on join and
+   after a network change. Beyond that, a node earns copies **one at a time**
+   on real traffic (slow start).
 7. **CPU matters little, "is this PC gaming" matters a lot, disk not at
    all.** Forwarding costs about 2.3% of one core per copy (measured), so CPU
    is a gate, not a ranking.
@@ -123,23 +129,28 @@ problem). The standard heuristic is the greedy *Compact Tree* algorithm,
 which adds one node at a time at its lowest-latency feasible attachment.
 
 **Why that doesn't hurt us.** NP-hard is about large `n`. With `n ≤ 9`
-watchers and depth ≤ 2, the search is small enough to be exact:
+watchers and depth ≤ 3, the search is small enough to be exact. Depth 3 is
+needed, not a fallback: with the default streamer budget of one copy, a
+depth-2 tree is the streamer, one relay, and everyone under it, which is the
+star again ([worked example](#several-supernodes-per-stream-a-worked-example),
+Option 1).
 
-- choose which of the streamer's `c_s` children are relays (at most
-  C(9,1) + C(9,2) = 54 options for `c_s ≤ 2`);
-- assign the remaining watchers to those relays so as to minimise the worst
-  latency: binary search over the threshold `T`, and for each `T` check
-  whether a **bipartite assignment with capacities** exists (a max-flow on
-  ≤ 20 nodes);
-- depth 3 (relays feeding relays) only when depth 2 is infeasible, using the
-  Compact Tree greedy plus local swaps.
+- A **skeleton** fixes which watchers sit at depth 1 (the streamer's `c_s`
+  children) and which relays sit at depth 2 under them. Only watchers with
+  copies > 0 can be in it, so it's enumerated over relays only. (For `c_s ≤ 2`,
+  depth 1 alone has C(9,1) + C(9,2) = 45 choices.)
+- For a fixed skeleton, every remaining watcher just needs a parent with a
+  free copy within the threshold `T`: a **bipartite assignment with
+  capacities** (a max-flow on ≤ 20 nodes). Binary search `T`.
+- Branch and bound: skip a skeleton whose own relays are already no better
+  than the best tree found.
+- Guard: with more than 6 relays, keep the 6 with the lowest latency to the
+  streamer (ties: most copies), or stop at 5 ms and use the Compact Tree
+  greedy plus local swaps. Past about 30 people, use the greedy alone.
 
-Either way it runs in well under a millisecond on the signaling server.
-Past about 30 people, switch to the greedy alone.
-
-**Feasibility, in one line.** With depth ≤ 2, a stream can reach at most
-`c_s + Σ (c_k over the streamer's best c_s children)` watchers. If that is
-less than `n`, a deeper tree or a lower bitrate is needed.
+**Feasibility.** With depth ≤ 3, a stream reaches at most
+`c_s + Σ_k c_k + Σ_j c_j` watchers, over the streamer's children `k` and their
+relay children `j`. If that is less than `n`, the stream is degraded (D14).
 
 **The highest bitrate that fits.** For a tree, every node needs
 `r ≤ B_i / (h × children_i)`, so the stream's ceiling is
@@ -151,7 +162,8 @@ r* = min over senders i of  B_i / (h × children_i)
 where `B_i` is the node's shareable upload. Example: one hub with 50 Mbps
 serving 8 others gives `r* = 50 / (1.3 × 8) ≈ 4.8 Mbps`. The server can tell
 the streamer "this room can carry about 4.8 Mbps; drop to 900p or 30 fps",
-which beats a silent degraded state.
+which beats a silent degraded state. This is `Stream.maxBitrateKbps` in the
+spec (D14).
 
 ---
 
@@ -160,16 +172,16 @@ which beats a silent degraded state.
 ```
 copies_i = min( floor( B_i / (h × r) ),  floor( cpuFree_i / k ) )
 
-B_i = min( seedCap_i,  w_i × U_i  −  voiceUp_i )
+B_i = min( seedCap_i,  U_i  −  voiceUp_i )
 ```
 
 | Symbol | Meaning | Value / source |
 |---|---|---|
-| `U_i` | Upload capacity estimate | Join probe, then raised by proven sending ([the check](#the-check-what-to-measure-and-when)) |
-| `w_i` | Link factor | 1.0 wired, 0.6 Wi-Fi (shared airtime and retransmissions make Wi-Fi relays much worse than their nominal rate) |
+| `U_i` | Upload capacity estimate | Join probe, then raised by proven sending ([the check](#the-check-what-to-measure-and-when)). It measures what Wi-Fi actually delivers, so there's no separate Wi-Fi factor; Wi-Fi's variance goes into the penalty `p_i` |
 | `voiceUp_i` | Voice mesh upload | ≈ 0.5 Mbps in a room of 10 |
 | `seedCap_i` | The member's seeding cap | 0 when seeding is off |
-| `h` | Headroom per copy | 1.3 (packet overhead, keyframe bursts, retransmissions) |
+| `h` | Headroom per copy | 1.3 (packet overhead, keyframe bursts, retransmissions); 1.1 in the `tight` degraded tier (D14) |
+| `p_i` | Reliability penalty, ms | Wi-Fi, battery, a recent failure. **Assumed values until measured** |
 | `k` | CPU per copy | ≈ 2.3% of one core per 8 Mbps copy (16% for 7 copies at 8.7 Mbps, measured on the dev Mac) |
 | `cpuFree_i` | Spare CPU | System idle time, smoothed; 0 while the PC is gaming |
 
@@ -192,7 +204,7 @@ B_i = min( seedCap_i,  w_i × U_i  −  voiceUp_i )
 
 | Source | Cost | Accuracy | Verdict |
 |---|---|---|---|
-| **ICE round-trip time on the mesh**: Pion sends a STUN keepalive on every connection every 2 s and records `CurrentRoundTripTime` per candidate pair (checked in `pion/ice` v4.4.9) | **Free** for pairs that already have a connection | Measures the real path, including TURN if used | **Use this** |
+| **ICE round-trip time on the mesh**: Pion sends a STUN keepalive on every connection (every 1 s in `cast`, set in `peer/media.go`; Pion's default is 2 s) and records `CurrentRoundTripTime` per candidate pair (checked in `pion/ice` v4.4.9) | **Free** for pairs that already have a connection | Measures the real path, including TURN if used | **Use this** |
 | Extra "probe" connections for members not in voice | One ICE connection per missing pair; keepalives are bytes per second | Same as above | Use it: at 10 people that's at most 45 pairs |
 | Vivaldi network coordinates (each node gets coordinates whose distances predict RTT) | Few samples per node | Median error ≈ 11% on 1740 Internet hosts | Only needed beyond ~50 people, where a full mesh stops being cheap |
 | RTT to the signaling server, added up | Free | Poor: two people in one city can both be far from the server | No |
@@ -295,9 +307,10 @@ latency-sensitive in the room.
    traffic) that the bitrate is too high for this connection.
 4. **Allow an opt-in second copy** (option 3 above), only when the budget
    check passes, and show what it buys.
-5. **Never fall back to "the streamer sends to everyone" silently.** Today's
-   degraded mode can do that. Instead: degraded with a suggested bitrate
-   (`r*`), and the streamer decides.
+5. **Never fall back to "the streamer sends to everyone".** Today's degraded
+   mode can do that. Decided instead (D14): lower the headroom to 1.1; if
+   that still doesn't fit, serve as many watchers as fit and let the rest
+   wait, with a suggested bitrate (`r*`) for the streamer to decide on.
 
 ---
 
@@ -311,7 +324,14 @@ A member chooses whether, and how much, they relay for others.
 |---|---|
 | `off` | Never relay. Still watch normally |
 | `on` | Relay up to `maxUploadMbps`, only for the stream I watch |
-| `on` + `anyStream` | Also relay a stream I'm not watching ("pure seeder"): costs my download too, only used when no watcher can relay |
+| `on` + `seedOnly` | **Only while I watch nothing** (decided): relay any stream ("pure seeder"), at the cost of my download; used only when no watcher can relay |
+
+**Why seed-only.** Every member is in **at most one tree**: as streamer, as
+watcher, or as seed-only relay. A member watching stream X and relaying
+stream Y would be in two trees, which breaks the
+[mesh's](mesh.md#what-a-pair-can-carry) one-track-per-direction design and
+doubles the member's download. Seed-only keeps the invariant and keeps "bring
+your own seeder".
 
 **Options** (all optional):
 
@@ -332,15 +352,15 @@ per hour**. A relay with 4 copies sends about 15 GB per hour, so 44 GB in a
 three-hour session. On a metered or capped connection that matters, so the
 app shows it and seeding is never switched on silently.
 
-**Default:** `off`, with the app asking once ("Help your friends' streams?
-Share up to … Mbps"), the same way it handles the mic mode: the app stores the
-answer. The tension: with seeding off everywhere and a 1-copy streamer, a
-stream can only serve one watcher at full quality. The server should say so
-plainly ("this stream needs 2 more seeders, or a lower bitrate"), and the app
-can nudge.
+**Default (decided, D13):** `off`, asked **when it matters**: when a stream
+the member watches is degraded, the app prompts "this stream needs 2 more
+helpers. Share up to 1 viewer's worth (≈ 3.7 GB per hour)?". The app stores
+the answer, as it does the mic mode. With seeding off everywhere and a 1-copy
+streamer, a stream can only serve one watcher at full quality; the degraded
+state (D14) says so, and the prompt is the way out.
 
 **Bring your own seeder.** The same code can run headless on a cloud VM
-(`cast seed -room …`) as a member that seeds `anyStream` and never watches.
+(`cast seed -room …`) as a seed-only member that never watches.
 That is a personal relay server for the group. Hyperscalers charge per GB
 (3.7 GB per copy-hour adds up), while some VPS plans include several TB of
 traffic per month, which makes it cheap. Optional, never required.
@@ -358,7 +378,7 @@ block only when a value changed beyond a threshold, or every 5 s at most.
 
 | Signal | Source | Cost | When |
 |---|---|---|---|
-| RTT to every peer, path type | ICE stats on the mesh | Free | Continuously (every 2 s from keepalives) |
+| RTT to every peer, path type | ICE stats on the mesh | Free | Continuously (every 1 s from keepalives) |
 | Loss and jitter seen by each child | RTCP receiver reports, already flowing | Free | Continuously |
 | What I'm actually sending | Byte counters per link | Free | Every 1 s |
 | Queuing on my uplink | RTT rise above the idle baseline while sending; with Pion's send-side bandwidth estimator (`pion/interceptor/pkg/gcc`, not registered today), its estimate too | Free / small | Continuously while sending |
@@ -367,7 +387,8 @@ block only when a value changed beyond a threshold, or every 5 s at most.
 | Wired / Wi-Fi, interface change | OS | Microseconds | On change |
 | On battery, thermal throttling | OS | Microseconds | On change |
 | Gaming: a fullscreen app in front, or the GPU busy | OS, platform-specific | Microseconds | Every 5 s |
-| **Upload capacity** | **Active probe** | ≈ 1–3 MB | On join; after an interface change; before a promotion beyond proven capacity; on request. **Never on a timer during a stream** |
+| **Upload capacity** | **Active probe** to the signaling server (today's speed test) | ≈ 1–3 MB | On join; after an interface change; on request. **Never on a timer during a stream** |
+| **Capacity beyond the probe** | **Slow start** on real traffic | Free | Before a node gets more copies than it has proven |
 
 **Why not run a speed test on every heartbeat, or periodically?**
 
@@ -383,21 +404,26 @@ block only when a value changed beyond a threshold, or every 5 s at most.
   4 copies for a minute with no loss and no RTT rise has **proven** 4 copies.
   No test can say more than that.
 
-**The precise probe: before promoting.** When the election wants node X to
-send `k` copies and X has not proven `k`, X sends padding over its existing
-idle links to the exact children it would serve, at the target rate, for
-about 0.5 s. The children report received rate, loss and whether their
-one-way delay was trending upward (the delay trend is the SLoPS idea behind
-pathload: delay rises once you send faster than the available bandwidth).
-Cost: `k × 10.6 Mbps × 0.5 s`, so about 2.7 MB for 4 copies. It measures the
-real paths at the real rate.
+**Slow start: promoting one copy at a time.** When the election wants node X
+to send more copies than it has proven, X gets **one** more child. For 5 s
+the server watches that child's receiver reports (loss, received rate) and
+X's RTT to its children (a rise means its uplink is queuing, the SLoPS idea
+behind pathload: delay grows once you send faster than the available
+bandwidth). Clean: the copy counts as proven and the next one can follow.
+Not clean: the child moves back to its previous parent.
+
+- **Why not a padding probe:** padding needs idle links to the exact
+  children (only the [mesh](mesh.md) has them), and padding on a link that
+  already carries live video can cause the loss it's measuring.
+- **Cost:** the worst case is a short glitch for one child, then a rollback.
+  Convergence is slower (1 to 4 copies in about 15 s); placement starts from
+  the join probe, so only capacity beyond what was measured slow-starts.
 
 **Estimate bookkeeping per node:**
 
-- `proven`: the highest rate sustained for ≥ 30 s with loss < 1% and no
-  queuing; it decays slowly (it is old news after a network change).
-- `probed`: the last probe's result; trusted for 10 minutes.
-- `U_i = max(proven, probed)`, falling back to the join probe.
+- `proven`: the highest number of copies sustained for ≥ 30 s with loss < 1%
+  and no queuing; it decays slowly (it is old news after a network change).
+- `U_i = max(proven × h × r, join probe)`.
 
 **Trust, but verify.** Children's receiver reports show what a relay actually
 delivers. A node whose delivery falls short of its claim is moved down,
@@ -420,8 +446,9 @@ setup plus a keyframe (about a second). Simple, but slower than today.
 **B. One mesh, many trees (recommended).** Every pair of members keeps
 **one** pre-negotiated connection carrying voice, plus one video and one
 game-audio track in each direction, idle by default. This works because,
-under D6 and D8, a node forwards **at most one stream**: its own or the one it
-watches. So one outgoing video track per pair is always enough, whatever the
+under D6 and D8, and with pure seeding limited to members who watch nothing, a
+node forwards **at most one stream**: its own, the one it watches, or the one
+it seeds. So one outgoing video track per pair is always enough, whatever the
 tree looks like.
 
 - A tree change is `ReplaceTrack` on the right senders (idle → live), the
@@ -480,29 +507,46 @@ elect(stream):
     if copies[streamer] >= |watchers|:
         candidate = star from the streamer                # rare with budget 1
     else:
-        candidate = best_depth2(nodes)                    # exact search
-        if not candidate.feasible:
-            candidate = compact_tree_greedy(nodes, max_depth=3) then local swaps
-    if not candidate.feasible:
-        candidate = best effort tree
-        candidate.degraded = true
+        candidate = best_tree(nodes, max_depth=3)         # exact search
+    if not candidate.feasible:                            # D14, tier "tight"
+        candidate = best_tree(nodes, max_depth=3, h=1.1)
+    if not candidate.feasible:                            # D14, tier "full"
+        candidate = largest feasible tree; the rest wait (noCapacity)
         candidate.maxBitrate = r*                         # suggest to the streamer
 
     if must_change(current) or improves_enough(candidate, current):
         current = candidate
-    plan probes for nodes asked to exceed their proven copies
+    slow-start nodes asked to exceed their proven copies (one copy at a time)
     publish current (with a backup parent per watcher if local failover is on)
 
-best_depth2(nodes):
-    for each set R of up to copies[streamer] watchers (the streamer's children):
+best_tree(nodes, max_depth):
+    for each skeleton: up to copies[streamer] watchers at depth 1, and relays
+                       (copies > 0) at depth 2 under them, within copies:
+        skip if the skeleton's own worst latency >= the best T so far
         binary-search T over sorted latency values:
-            feasible(T) = max-flow assigns every other watcher to some k in R
-                          with l(s,k) + f + p(k) + l(k,w) <= T and ≤ copies[k] each
-        keep the R with the best (T, churn, mean, relays)
+            feasible(T) = max-flow assigns every other watcher to a skeleton
+                          node or the streamer, with path latency <= T and
+                          within each parent's free copies
+        keep the skeleton with the best (T, churn, mean, relays)
 ```
 
+**Prototype** (Python, on the [worked example](#several-supernodes-per-stream-a-worked-example)
+and two synthetic rooms; worst latency only, without the churn and mean
+tie-breakers):
+
+| Case | Result | Skeletons | Time (Python) |
+|---|---|---|---|
+| Example, budget 1, depth ≤ 2 | 42 ms (Option 1, the star) | 9 | 0.1 ms |
+| Example, budget 1, depth ≤ 3 | **34 ms** (Option 2's worst) | 37 | 0.3 ms |
+| Example, budget 2, depth ≤ 3 | **27 ms** (Option 3) | 261 | 2 ms |
+| Mixed seeders, budget 1 | — | 1,025 | 4 ms |
+| All 9 watchers relay, budget 2 | — | 81,036 | 274 ms |
+
+Go should be one to two orders of magnitude faster than Python; that's an
+estimate to measure, and the 6-relay guard bounds the worst case either way.
+
 Run it on the signaling server (it has the global view; at this size the
-work is trivial). Peers report; they don't choose their own parents, which
+work is small). Peers report; they don't choose their own parents, which
 would oscillate as everyone chases the same good relay.
 
 ---
@@ -542,7 +586,7 @@ would oscillate as everyone chases the same good relay.
 | Use latency between members | **Agree, and it's free** | The mesh already measures it; the example shows 19–36% lower worst latency |
 | Don't make the streamer serve everyone | **Agree** | Default budget of 1 copy, opt-in second copy with its price shown; bufferbloat makes this matter even more than CPU |
 | Run a check when the heartbeat arrives, without blocking it | **Agree on not blocking; disagree on the trigger** | Heartbeats are 4 per second; tie measurements to events instead, and keep the heartbeat as the carrier of cached results |
-| Measure network speed in the check | **Disagree as a routine; agree as a targeted probe** | A routine speed test competes with the stream and the game, and small tests measure capacity, not what's available. Passive proof covers most cases; probe only before a promotion, on the exact links |
+| Measure network speed in the check | **Disagree as a routine; agree on join** | A routine speed test competes with the stream and the game, and small tests measure capacity, not what's available. Passive proof covers most cases; beyond the join probe, nodes earn copies one at a time (slow start) |
 | Measure CPU and memory | **Agree, as gates** | They rarely limit forwarding; "is a game running" is the signal that matters |
 | Measure disk | **Disagree** | Relays never touch disk |
 | Promote on the basis of the check | **Agree, but as constraints, not a score** | Converting everything into copies and milliseconds avoids arbitrary weights between unlike units |
@@ -556,12 +600,14 @@ would oscillate as everyone chases the same good relay.
 **Spec ([AGENT_PROTOCOL.md](../cast/AGENT_PROTOCOL.md)):**
 
 - `JoinParams.network.canHost` → `seeding: { mode: "off"|"on", maxUploadMbps?,
-  anyStream?, notWhileGaming?, onlyOnPower? }`; new `network.setSeeding`.
+  seedOnly?, notWhileGaming?, onlyOnPower? }`; new `network.setSeeding`.
 - `StreamParams.maxCopies` (default 1): the streamer's budget.
-- `Stream` gets `tree` (parent of each watcher, relay reasons) and
-  `maxBitrateKbps` (`r*`) when degraded.
-- Candidate decisions: **streamer budget 1 by default**, **seeding opt-in
-  with a cap**, **measure passively, probe before promotion**.
+- `Stream` gets `tree` (parent of each watcher, relay reasons).
+  `maxBitrateKbps`, `unserved` and the degraded tiers are already in the spec
+  (D14).
+- Candidate decisions: **streamer budget 1 by default**, **measure passively,
+  slow-start promotions**. Already decided: seeding opt-in with a cap and a
+  just-in-time prompt (D13).
 
 **Code:**
 
@@ -571,28 +617,31 @@ would oscillate as everyone chases the same good relay.
 | `metrics` block in `status`, sent on change or every 5 s | `proto`, `peer/client.go` |
 | Mesh connection for every pair, with idle video and game-audio tracks | `peer/voice.go` becomes the general mesh |
 | Tree topology: parent per watcher; links derived from the parent map | `proto.Topology`, `peer/client.go` |
-| Election: copies, latency matrix, exact depth-2 search, greedy depth 3, hysteresis | `signaling/election.go` |
+| Election: copies, latency matrix, exact depth ≤ 3 search with the 6-relay guard, greedy fallback, degraded tiers (#20), hysteresis | `signaling/election.go` |
 | Failure detection per relay (watchers report their parent) | `signaling/server.go` |
-| Pre-promotion probe (padding over idle links) and its report | `peer/links.go`, `proto` |
+| Slow start: one extra copy, judged on the child's receiver reports and the relay's RTT, with rollback | `signaling/server.go`, `proto` |
 | Send-side bandwidth estimator (`pion/interceptor/pkg/gcc`) as a queuing signal | `peer/media.go` |
 
-**Sequencing with [multi-stream](multi-stream.md):** multi-stream can land
-first with one relay per stream and the streamer-last order. The **mesh
-connection** (design B) should be decided before multi-stream Phase 4, since
-both change how the client builds links.
+**Sequencing with [multi-stream](multi-stream.md):** multi-stream lands first
+with one relay per stream and the streamer-last order, and its Phase 4 keeps
+today's per-tree links. The **mesh connection** (design B) doesn't block it:
+if adopted, it replaces how links are built, behind the same entry point. It
+has to be decided before this election is built (step 7), since failover
+design B depends on it.
 
 ---
 
 ## Open questions
 
-1. **Seeding default:** `off` with a one-time prompt (proposed), or `on`
-   with a small automatic cap such as one copy?
+1. ~~Seeding default~~ **Decided (D13):** `off`, asked when a watched stream
+   is short of relays.
 2. **Mesh for everyone:** accept up to 45 always-on connections in a room of
    10, to get free latency data and instant tree changes? Measured and
-   brainstormed in [mesh.md](mesh.md): about 2.2 MB and 0.65% of a core per
-   member; recommended, with a room cap and a "hide my IP" option.
-3. **Pure seeders:** allow members to relay streams they don't watch, at the
-   cost of their download?
+   brainstormed in [mesh.md](mesh.md): about 2.2 MB and 0.7% of a core per
+   member; recommended, with the room cap (D11) and "hide my IP" (D12), both
+   decided. Waiting on real-hardware measurements.
+3. ~~Pure seeders~~ **Decided:** only for members who watch nothing
+   (`seedOnly`), so every member stays in at most one tree.
 4. **Streamer's second copy:** offered automatically when it saves more than
    some threshold, or only as a manual setting?
 5. **Local failover:** worth the reserved capacity, or is server-driven
@@ -628,7 +677,8 @@ both change how the client builds links.
   [Audio-to-video synchronization](https://en.wikipedia.org/wiki/Audio-to-video_synchronization)
   and [arXiv 2212.01686](https://arxiv.org/pdf/2212.01686)
 - Pion source, checked locally: `pion/ice` v4.4.9 records
-  `CurrentRoundTripTime` per candidate pair with a 2 s keepalive;
+  `CurrentRoundTripTime` per candidate pair, with a 2 s keepalive by default
+  (`cast` sets 1 s);
   `AvailableOutgoingBitrate` is not filled in; `pion/interceptor` v0.1.51
   ships `pkg/gcc` (send-side bandwidth estimation), which `cast` doesn't
   register yet.
